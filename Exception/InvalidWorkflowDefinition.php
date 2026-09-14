@@ -832,6 +832,26 @@ final class InvalidWorkflowDefinition extends LogicException implements SagaExce
         ));
     }
 
+    public static function recoveryWaitWithoutLiveness(string $waitState, string $workflow): self
+    {
+        return new self(sprintf(
+            'Wait state "%s" in workflow "%s" is reachable from onGlobalTimeout, where globalTimeout is already consumed. '
+            .'Declare #[WaitFor(deadlineSeconds:, onDeadline:)] to bound this wait. Another global cap cannot protect '
+            .'the recovery path; a heartbeat is not an option because this wait gates no issued effect.',
+            $waitState, $workflow,
+        ));
+    }
+
+    public static function recoveryGatingWaitWithoutLiveness(string $waitState, string $workflow): self
+    {
+        return new self(sprintf(
+            'Wait state "%s" in workflow "%s" gates an issued effect and is reachable from onGlobalTimeout, where '
+            .'globalTimeout is already consumed. Declare #[WaitFor(heartbeatSeconds:)] to keep this wait observable '
+            .'without finalizing an unconfirmed effect. Another global cap cannot protect the recovery path.',
+            $waitState, $workflow,
+        ));
+    }
+
     public static function compensationUnverifiableAtGatingWait(string $stateKey, string $waitState, string $workflow): self
     {
         return new self(sprintf(

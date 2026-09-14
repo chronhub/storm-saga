@@ -159,7 +159,7 @@ final class ListSagasCommand extends Command
     }
 
     /**
-     * The paused, waived and child markers, the three facts a listing row cannot show as a column
+     * The operational markers a listing row cannot show as a column
      * without spending width on a mostly-empty one.
      *
      * A freeze leaves the status at `running` by design, a paused saga being a living one that is not
@@ -182,6 +182,10 @@ final class ListSagasCommand extends Command
 
         if ($saga->waivedAt !== null) {
             $flags[] = 'waived';
+        }
+
+        if ($saga->globalDeadlineConsumedAt !== null) {
+            $flags[] = 'cap-consumed';
         }
 
         if ($saga->parentCorrelationId !== null) {

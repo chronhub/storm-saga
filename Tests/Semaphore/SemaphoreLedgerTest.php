@@ -125,6 +125,7 @@ final class SemaphoreLedgerTest extends TestCase
         $ledger = SemaphoreLedger::open($this->now, $this->vars(capacity: 1));
         $first = $ledger->acquire('payment', 'p-1');
         assert($first instanceof Granted);
+        $grantId = $ledger->vars()[SemaphoreLedger::HOLDERS][SlotToken::of('payment', 'p-1')]['grant_id'];
 
         $again = $ledger->acquire('payment', 'p-1');
 
@@ -134,7 +135,7 @@ final class SemaphoreLedgerTest extends TestCase
         // the holder record carries who holds it, not just when it lapses: the sweep reports the
         // expropriated waiter by these two fields, so a record missing one reaps anonymously
         $this->assertSame(
-            ['waiter_type' => 'payment', 'waiter_corr' => 'p-1', 'expires_at' => $first->expiresAt],
+            ['waiter_type' => 'payment', 'waiter_corr' => 'p-1', 'expires_at' => $first->expiresAt, 'grant_id' => $grantId],
             $ledger->vars()[SemaphoreLedger::HOLDERS][SlotToken::of('payment', 'p-1')],
         );
     }
@@ -207,7 +208,7 @@ final class SemaphoreLedgerTest extends TestCase
         // its token as a STRING: a queue entry's token arrives from stored vars, where a numeric-
         // looking one would have become an int on the way in
         $this->assertSame(
-            ['waiter_type' => 'payment', 'waiter_corr' => 'p-2', 'expires_at' => $this->now->addSeconds(90)->toString()],
+            ['waiter_type' => 'payment', 'waiter_corr' => 'p-2', 'expires_at' => $this->now->addSeconds(90)->toString(), 'grant_id' => $ledger->grants()[0]->grantId],
             $holders[SlotToken::of('payment', 'p-2')] ?? null,
         );
         $this->assertSame([], $ledger->vars()[SemaphoreLedger::QUEUE]);

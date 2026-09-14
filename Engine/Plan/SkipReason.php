@@ -46,6 +46,9 @@ enum SkipReason
      */
     case CapWaived;
 
+    /** A delayed global timer reached an instance whose deadline already routed it into recovery. */
+    case GlobalDeadlineConsumed;
+
     /** A user signal arrived but the workflow declares no handler for its class; dropped with a reason, no buffering. */
     case NoSignalHandler;
 

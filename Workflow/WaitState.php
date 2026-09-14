@@ -15,8 +15,8 @@ use Storm\Saga\Attributes\WaitFor;
  * match an optional `$extract` writes named keys into `vars`, either a bound method that is the matcher's
  * data-side twin or, equivalently, a `$extractMap` of `varName => payloadField`; at most one is set and
  * the builder rejects both. `$extractMap` is kept raw so it can be inspected design-time. `$retriable`
- * marks a gating wait whose success is inevitable post-pivot: the engine re-arms it past the instance-wide
- * global cap instead of halting.
+ * marks a gating wait whose success is inevitable post-pivot: after the global cap, the engine
+ * disarms its heartbeat and hands off to reconciliation instead of halting.
  *
  * Optional `$retime` is the `#[Retimable]` grant: a signal may move this wait's armed deadline within
  * the declared caps. Only a wait with its own finalizing deadline may carry it; the build enforces that.

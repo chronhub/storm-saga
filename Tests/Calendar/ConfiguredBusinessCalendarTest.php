@@ -19,6 +19,62 @@ use Storm\Saga\Exception\InvalidBusinessCalendar;
 final class ConfiguredBusinessCalendarTest extends TestCase
 {
     #[Test]
+    public function fractional_seconds_carry_across_the_close(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar;
+        $from = PointInTime::from('2026-06-15T16:00:00.250000Z');
+        self::assertSame('2026-06-16T10:00:00.250000+00:00', $calendar->advance($from, 0, 2)->toString());
+    }
+
+    #[Test]
+    public function a_fractional_remainder_cannot_land_after_the_close(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar;
+        $from = PointInTime::from('2026-06-15T16:00:00.250000Z');
+        self::assertSame('2026-06-16T09:00:00.250000+00:00', $calendar->advance($from, 0, 1)->toString());
+    }
+
+    #[Test]
+    public function midnight_close_preserves_the_next_business_day(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar(openHour: 0, closeHour: 24);
+        $from = PointInTime::from('2026-06-15T23:00:00.000000Z');
+        self::assertSame('2026-06-16T01:00:00.000000+00:00', $calendar->advance($from, 0, 2)->toString());
+    }
+
+    #[Test]
+    public function spring_transition_consumes_elapsed_business_hours(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar(businessDays: [7], openHour: 0, closeHour: 6, timezone: 'America/New_York');
+        $from = PointInTime::from('2026-03-08T06:00:00.000000Z');
+        self::assertSame('2026-03-08T08:00:00.000000+00:00', $calendar->advance($from, 0, 2)->toString());
+    }
+
+    #[Test]
+    public function fall_transition_consumes_elapsed_business_hours(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar(businessDays: [7], openHour: 0, closeHour: 6, timezone: 'America/New_York');
+        $from = PointInTime::from('2026-11-01T04:00:00.000000Z');
+        self::assertSame('2026-11-01T06:00:00.000000+00:00', $calendar->advance($from, 0, 2)->toString());
+    }
+
+    #[Test]
+    public function elapsed_business_hours_preserve_microseconds_across_dst(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar(businessDays: [7], openHour: 0, closeHour: 6, timezone: 'America/New_York');
+        $from = PointInTime::from('2026-03-08T06:00:00.250000Z');
+        self::assertSame('2026-03-08T08:00:00.250000+00:00', $calendar->advance($from, 0, 2)->toString());
+    }
+
+    #[Test]
+    public function midnight_close_still_skips_a_holiday(): void
+    {
+        $calendar = new ConfiguredBusinessCalendar(openHour: 0, closeHour: 24, holidays: ['2026-06-16']);
+        $from = PointInTime::from('2026-06-15T23:00:00.000000Z');
+        self::assertSame('2026-06-17T01:00:00.000000+00:00', $calendar->advance($from, 0, 2)->toString());
+    }
+
+    #[Test]
     public function a_weekday_within_hours_is_business_time(): void
     {
         $this->assertTrue($this->calendar()->isBusinessTime(PointInTime::from('2026-06-15T10:00:00.000000Z')));

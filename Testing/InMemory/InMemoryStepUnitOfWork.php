@@ -12,11 +12,12 @@ use Throwable;
 
 /**
  * The in-memory `SagaStepUnitOfWork`: a per-id reentrancy guard plus a snapshot of the WHOLE shared state,
- * honoring the port's three adapter laws in sequential form. Law 1 by snapshot and restore, since
+ * honoring the port's four adapter laws in sequential form. Law 1 by snapshot and restore, since
  * every adapter writes the same `InMemorySagaState`, a throwable restores instances, correlations,
  * timers, and commands together; law 2 by construction, the key is released in the same finally
  * that settles the unit; law 3 by the held-key check, an occupied fence returns false without
- * blocking, which is how a test stages deterministic reentrant contention.
+ * blocking, which is how a test stages deterministic reentrant contention; law 4 by reading the
+ * shared state directly, with no database snapshot that can go stale.
  *
  * What this deliberately does NOT model: advisory locks between processes, `SKIP LOCKED`, or the
  * savepoint nesting a DBAL fence performs under an ambient transaction. A nested step is refused

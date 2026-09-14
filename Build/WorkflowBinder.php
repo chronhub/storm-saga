@@ -10,7 +10,10 @@ use Psr\Container\ContainerInterface;
 use Psr\Container\NotFoundExceptionInterface;
 use ReflectionClass;
 use ReflectionException;
+use ReflectionIntersectionType;
 use ReflectionNamedType;
+use ReflectionType;
+use ReflectionUnionType;
 use Storm\Saga\Attributes\Compensate;
 use Storm\Saga\Attributes\Fallback;
 use Storm\Saga\Attributes\Schedule as ScheduleAttribute;
@@ -28,6 +31,7 @@ use Storm\Saga\Workflow\Fallback\FallbackStrategy;
 use Storm\Saga\Workflow\Fallback\StaticFallback;
 use Storm\Saga\Workflow\ScheduleState;
 use Storm\Saga\Workflow\SignalResult;
+use Traversable;
 
 /**
  * The compile's binding phase: turn declared NAMES into invocables and instances. Guard, matcher,
@@ -104,18 +108,70 @@ final readonly class WorkflowBinder
 
         // exactly two invocable arguments: fewer and the handler can't SEE the vars; its stay()
         // would wipe them; more required and the two-arg invocation can never satisfy it
-        if (! $return instanceof ReflectionNamedType || $return->getName() !== SignalResult::class
+        if (! $return instanceof ReflectionNamedType || $return->getName() !== SignalResult::class || $return->allowsNull()
             || $method->getNumberOfRequiredParameters() > 2 || $method->getNumberOfParameters() < 2) {
             throw InvalidWorkflowDefinition::signalHandlerBadSignature($signal->handler, $signal->signal, $workflow);
         }
 
+        if (! class_exists($signal->signal)) {
+            throw InvalidWorkflowDefinition::unknownSignalClass($signal->signal, $workflow);
+        }
         $first = $method->getParameters()[0]->getType();
-        if ($first instanceof ReflectionNamedType && $first->getName() !== 'object'
-            && ($first->isBuiltin() || ! is_a($signal->signal, $first->getName(), true))) {
-            throw InvalidWorkflowDefinition::signalHandlerCannotAcceptSignal($signal->handler, $first->getName(), $signal->signal, $workflow);
+        $scope = $method->getDeclaringClass();
+        if (! $this->acceptsArgument($first, new ReflectionClass($signal->signal), $scope)) {
+            throw InvalidWorkflowDefinition::signalHandlerCannotAcceptSignal($signal->handler, (string) $first, $signal->signal, $workflow);
+        }
+        $second = $method->getParameters()[1];
+        if ($second->isPassedByReference() || ! $this->acceptsArgument($second->getType(), null, $scope)) {
+            throw InvalidWorkflowDefinition::signalHandlerBadSignature($signal->handler, $signal->signal, $workflow);
         }
 
         return $method->getClosure($instance);
+    }
+
+    /**
+     * @param  ReflectionClass<object>|null  $argument  null denotes an arbitrary vars array
+     * @param  ReflectionClass<object>  $scope
+     */
+    private function acceptsArgument(?ReflectionType $type, ?ReflectionClass $argument, ReflectionClass $scope): bool
+    {
+        if ($type === null) {
+            return true;
+        }
+        if ($type instanceof ReflectionUnionType) {
+            foreach ($type->getTypes() as $member) {
+                if ($this->acceptsArgument($member, $argument, $scope)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        if ($type instanceof ReflectionIntersectionType) {
+            foreach ($type->getTypes() as $member) {
+                if (! $this->acceptsArgument($member, $argument, $scope)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        if (! $type instanceof ReflectionNamedType) {
+            return false;
+        }
+        $name = $type->getName();
+        if ($argument === null) {
+            return in_array($name, ['array', 'iterable', 'mixed'], true);
+        }
+
+        return match ($name) {
+            'mixed', 'object' => true,
+            'iterable' => $argument->implementsInterface(Traversable::class),
+            'callable' => $argument->hasMethod('__invoke') && $argument->getMethod('__invoke')->isPublic(),
+            'self' => is_a($argument->getName(), $scope->getName(), true),
+            'parent' => ($parent = $scope->getParentClass()) !== false && is_a($argument->getName(), $parent->getName(), true),
+            default => ! $type->isBuiltin() && is_a($argument->getName(), $name, true),
+        };
     }
 
     /**

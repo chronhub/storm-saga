@@ -7,6 +7,7 @@ namespace Storm\Saga\Runtime\Dbal;
 use Doctrine\DBAL\Connection;
 use LogicException;
 use Psr\EventDispatcher\EventDispatcherInterface;
+use Psr\Log\LoggerInterface;
 use Storm\Clock\PointInTime;
 use Storm\Contracts\Clock\Clock;
 use Storm\Contracts\Message\MessageContext;
@@ -89,6 +90,8 @@ final class DbalSagaRuntimeBuilder
     private ?WorkflowInstanceStore $instances = null;
 
     private ?WorkflowTimerStore $timers = null;
+
+    private ?LoggerInterface $logger = null;
 
     private function __construct(
         private readonly WorkflowRegistry $registry,
@@ -181,6 +184,17 @@ final class DbalSagaRuntimeBuilder
     }
 
     /**
+     * The engine's observation channel, where an outcome routed to no instance leaves its line;
+     * unset, the engine says nothing, the standalone shape the container never takes.
+     */
+    public function logger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+
+        return $this;
+    }
+
+    /**
      * @throws LogicException when a required capability was not given: the connection, the event
      *                        resolver, the clock, or the dispatcher; a missing capability is
      *                        refused loud, never replaced by a weaker stand-in
@@ -228,6 +242,6 @@ final class DbalSagaRuntimeBuilder
             $events,
         );
 
-        return new Engine($this->registry, $executor, $instances, $writer);
+        return new Engine($this->registry, $executor, $instances, $writer, $this->logger);
     }
 }

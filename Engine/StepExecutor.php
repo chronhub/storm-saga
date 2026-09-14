@@ -16,6 +16,7 @@ use Storm\Saga\Engine\Plan\SkipReason;
 use Storm\Saga\Event\SagaAnnouncement;
 use Storm\Saga\Event\SagaCancelRefused;
 use Storm\Saga\Event\SagaOutcomeDiscarded;
+use Storm\Saga\Exception\SagaAnnouncementFailed;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Exception\WorkflowNotFound;
@@ -99,6 +100,7 @@ final readonly class StepExecutor
      * @throws WorkflowStateVersionMismatch when the loaded row's state version disagrees with the declaration
      * @throws WorkflowStateRejected when the declared validator refuses the bag about to persist
      * @throws StaleWorkflowInstance when the OCC update loses to a competing step
+     * @throws SagaAnnouncementFailed when an announcement listener fails after the unit of work returns
      * @throws SagaStorageFailure when the saga storage fails
      * @throws Throwable the performer's and the committer's tails, re-thrown
      */
@@ -277,6 +279,7 @@ final readonly class StepExecutor
      * @throws WorkflowStateVersionMismatch ahead of the code, behind with no migrator, or a broken hop
      * @throws WorkflowStateRejected when the migrated bag fails the declared validator
      * @throws StaleWorkflowInstance when a competing step moved the OCC version underneath
+     * @throws SagaAnnouncementFailed when an announcement listener fails after the unit of work returns
      * @throws SagaStorageFailure when the saga storage fails
      */
     public function migrateState(WorkflowRegistry $registry, WorkflowId $id): ExecutionReport
@@ -309,31 +312,46 @@ final readonly class StepExecutor
      *
      * @param  Closure(PointInTime): StepResult  $step
      *
+     * @throws SagaAnnouncementFailed when dispatch fails after the unit of work returns
      * @throws Throwable propagated from the step; the unit restored, nothing dispatched
      */
     private function fenced(WorkflowId $id, Closure $step): StepResult
     {
         $result = StepResult::busy();
 
-        $acquired = $this->fence->tryWithin($id, function () use ($step, &$result): void {
-            // one instant per step: policy, machine and enforcer share it. The committer is NOT a
-            // sharer: it takes its own instant when arming timers, so a fire instant counts from
-            // the commit, not from the policy read; a step is deliberately not a pure function of
-            // this one now
-            $result = $step($this->clock->now());
-        });
+        try {
+            $acquired = $this->fence->tryWithin($id, function () use ($step, &$result): void {
+                // one instant per step: policy, machine and enforcer share it. The committer is NOT a
+                // sharer: it takes its own instant when arming timers, so a fire instant counts from
+                // the commit, not from the policy read; a step is deliberately not a pure function of
+                // this one now
+                $result = $step($this->clock->now());
+            });
+        } catch (SagaAnnouncementFailed $error) {
+            // A nested saga's announcement failed inside THIS step, whose unit has rolled back.
+            $cause = $error->cause;
+            while ($cause instanceof SagaAnnouncementFailed) {
+                $cause = $cause->cause;
+            }
+
+            throw $cause;
+        }
 
         if (! $acquired) {
             return StepResult::busy();
         }
 
-        foreach ($result->voiced as $event) {
-            $this->events->dispatch($event);
-        }
-        if ($result->report === ExecutionReport::Applied) {
-            foreach ($result->announcements as $event) {
+        try {
+            foreach ($result->voiced as $event) {
                 $this->events->dispatch($event);
             }
+            if ($result->report === ExecutionReport::Applied) {
+                foreach ($result->announcements as $event) {
+                    $this->events->dispatch($event);
+                }
+            }
+        } catch (Throwable $error) {
+            throw new SagaAnnouncementFailed($error);
         }
 
         return $result;

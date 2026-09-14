@@ -76,7 +76,7 @@ final class SagaInspectionGatewayTest extends TestCase
         // a dropped cast would hand an operator surface a value it cannot render
         $row = [...$this->instanceRow(), 'version' => '7', 'generation' => '3', 'definition_version' => '5',
             'retry_total' => '4', 'state_version' => '2', 'retimes' => '6', 'type_paused' => 1,
-            'started_at' => 1_700_000_000, 'updated_at' => 1_700_000_001, 'waived_at' => 1_700_000_002,
+            'started_at' => 1_700_000_000, 'updated_at' => 1_700_000_001, 'global_deadline_consumed_at' => null, 'waived_at' => 1_700_000_002,
             'parent_workflow_type' => 1_700_000_003, 'parent_correlation_id' => 1_700_000_004,
             'root_correlation_id' => 1_700_000_005, 'paused_at' => 1_700_000_006,
             'paused_reason' => 1_700_000_007];
@@ -105,7 +105,7 @@ final class SagaInspectionGatewayTest extends TestCase
     {
         // the null side of every optional field: a flipped ternary would answer null where a value
         // stands and a value where none does, and only both directions asserted tell them apart
-        $row = [...$this->instanceRow(), 'started_at' => null, 'updated_at' => null, 'waived_at' => null,
+        $row = [...$this->instanceRow(), 'started_at' => null, 'updated_at' => null, 'global_deadline_consumed_at' => null, 'waived_at' => null,
             'paused_at' => null, 'paused_reason' => null, 'parent_workflow_type' => null,
             'parent_correlation_id' => null, 'root_correlation_id' => null];
 
@@ -320,9 +320,9 @@ final class SagaInspectionGatewayTest extends TestCase
     {
         $typed = [...self::summaryRow(), 'version' => '7', 'generation' => '3', 'definition_version' => '5',
             'retry_total' => '4', 'type_paused' => 1, 'started_at' => 1_700_000_030,
-            'updated_at' => 1_700_000_031, 'waived_at' => 1_700_000_032,
+            'updated_at' => 1_700_000_031, 'global_deadline_consumed_at' => null, 'waived_at' => 1_700_000_032,
             'parent_correlation_id' => 1_700_000_033, 'paused_at' => 1_700_000_034];
-        $bare = [...self::summaryRow(), 'started_at' => null, 'updated_at' => null, 'waived_at' => null,
+        $bare = [...self::summaryRow(), 'started_at' => null, 'updated_at' => null, 'global_deadline_consumed_at' => null, 'waived_at' => null,
             'parent_correlation_id' => null, 'paused_at' => null, 'type_paused' => false];
 
         $sagas = $this->gateway([[$typed, $bare]])->list()->sagas;
@@ -451,7 +451,7 @@ final class SagaInspectionGatewayTest extends TestCase
             'workflow_type' => 'onboarding', 'correlation_id' => 'c-1', 'state_key' => 'await_kyc',
             'status' => 'running', 'version' => 1, 'generation' => 1, 'definition_version' => 1,
             'retry_total' => 0, 'started_at' => '2026-08-23 10:00:00+00',
-            'updated_at' => '2026-08-23 10:05:00+00', 'waived_at' => null,
+            'updated_at' => '2026-08-23 10:05:00+00', 'global_deadline_consumed_at' => null, 'waived_at' => null,
             'paused_at' => null, 'parent_correlation_id' => null, 'type_paused' => false,
         ];
     }
@@ -466,7 +466,7 @@ final class SagaInspectionGatewayTest extends TestCase
             'vars' => '{}', 'retries' => '{}', 'compensations' => '[]', 'version' => 7,
             'started_at' => '2026-08-23 10:00:00+00', 'updated_at' => '2026-08-23 10:05:00+00',
             'generation' => 3, 'definition_version' => 5, 'state_version' => 2, 'retry_total' => 4,
-            'retimes' => 6, 'waived_at' => '2026-08-23 10:06:00+00',
+            'retimes' => 6, 'global_deadline_consumed_at' => null, 'waived_at' => '2026-08-23 10:06:00+00',
             'paused_at' => '2026-08-23 10:07:00+00', 'paused_reason' => 'operator on call',
             'parent_workflow_type' => 'identity', 'parent_correlation_id' => 'root-1',
             'root_correlation_id' => 'root-0', 'type_paused' => true,

@@ -142,6 +142,7 @@ final class SemaphoreLedger
                 'waiter_type' => $waiterType,
                 'waiter_corr' => $waiterCorrelation,
                 'expires_at' => $expiresAt,
+                'grant_id' => bin2hex(random_bytes(16)),
             ];
             $this->vars[self::HOLDERS] = $holders;
 
@@ -277,17 +278,20 @@ final class SemaphoreLedger
         while (count($holders) < $capacity && $queue !== []) {
             $entry = array_shift($queue);
             $expiresAt = $this->lease((int) $entry['grant_ttl']);
+            $grantId = bin2hex(random_bytes(16));
             // @infection-ignore-all; equivalent: PHP casts an array key to string on its own
             $holders[(string) $entry['token']] = [
                 'waiter_type' => $entry['waiter_type'],
                 'waiter_corr' => $entry['waiter_corr'],
                 'expires_at' => $expiresAt,
+                'grant_id' => $grantId,
             ];
             $this->grants[] = new GrantSlot(
                 (string) ($this->vars[self::RESOURCE] ?? ''),
                 (string) $entry['waiter_type'],
                 (string) $entry['waiter_corr'],
                 $expiresAt,
+                $grantId,
             );
         }
 
@@ -305,11 +309,10 @@ final class SemaphoreLedger
     }
 
     /**
-     * @return array<string, array{waiter_type: string, waiter_corr: string, expires_at: string}>
+     * @return mixed[]
      */
     private function holders(): array
     {
-        /** @var array<string, array{waiter_type: string, waiter_corr: string, expires_at: string}> */
         return is_array($this->vars[self::HOLDERS] ?? null) ? $this->vars[self::HOLDERS] : [];
     }
 

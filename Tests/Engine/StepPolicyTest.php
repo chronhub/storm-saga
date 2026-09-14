@@ -62,6 +62,15 @@ final class StepPolicyTest extends TestCase
     // -------------------------------------------------------------- start
 
     #[Test]
+    public function a_global_timer_after_recovery_started_skips_as_consumed(): void
+    {
+        $row = $this->running('await')->forcedTo('await', $this->now());
+        $plan = $this->policy->plan(Signal::globalDeadline(), $row, $this->def(), $this->now());
+        $this->assertInstanceOf(Skip::class, $plan);
+        $this->assertSame(SkipReason::GlobalDeadlineConsumed, $plan->reason);
+    }
+
+    #[Test]
     public function a_start_plans_a_fresh_instance_when_none_exists(): void
     {
         $plan = $this->policy->plan(Signal::start(['a' => 1], ['actor' => 'cli']), null, $this->def(), $this->now());
@@ -520,6 +529,22 @@ final class StepPolicyTest extends TestCase
         $plan = $this->policy->plan(Signal::stateTimeout('await'), $row, $this->def(), $this->now());
 
         $this->assertInstanceOf(HaltAtGlobalCap::class, $plan);
+    }
+
+    #[Test]
+    public function a_non_retriable_gating_wait_after_consumption_is_bounded(): void
+    {
+        $row = $this->running('await')->forcedTo('await', $this->now());
+        $plan = $this->policy->plan(Signal::stateTimeout('await'), $row, $this->def(), $this->now());
+        $this->assertInstanceOf(HaltAtGlobalCap::class, $plan);
+    }
+
+    #[Test]
+    public function a_retriable_gating_wait_after_consumption_is_waived(): void
+    {
+        $row = $this->running('retry_await')->forcedTo('retry_await', $this->now());
+        $plan = $this->policy->plan(Signal::stateTimeout('retry_await'), $row, $this->def(), $this->now());
+        $this->assertInstanceOf(WaiveGlobalCap::class, $plan);
     }
 
     #[Test]

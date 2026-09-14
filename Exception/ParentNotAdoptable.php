@@ -36,16 +36,12 @@ use Storm\Saga\Store\WorkflowStatus;
  */
 final class ParentNotAdoptable extends RuntimeException implements SagaException
 {
-    /**
+    private function __construct(string $message, /**
      * The announceable reason, the vocabulary the spawner's skip already speaks.
      */
-    public readonly string $reason;
-
-    private function __construct(string $message, string $reason)
+        public readonly string $reason)
     {
         parent::__construct($message);
-
-        $this->reason = $reason;
     }
 
     public static function missing(string $childCorrelationId, string $parentCorrelationId): self

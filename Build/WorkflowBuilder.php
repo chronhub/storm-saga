@@ -120,9 +120,7 @@ final readonly class WorkflowBuilder
         }
 
         // signal handlers bound to the instance; the map's key set IS the definition's accepted signals
-        $signalHandlers = array_map(function ($signal) use ($workflow, $name, $class) {
-            return $this->binder->bindSignalHandler($class, $signal, $workflow, $name);
-        }, $signals);
+        $signalHandlers = array_map(fn ($signal) => $this->binder->bindSignalHandler($class, $signal, $workflow, $name), $signals);
 
         // each state is born complete; transitions readonly at the constructor, nothing mutated after
         $states = [];

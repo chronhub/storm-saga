@@ -6,6 +6,7 @@ namespace Storm\Saga\Locking;
 
 use Closure;
 use RuntimeException;
+use Storm\Saga\Exception\FenceIsolationRefused;
 use Storm\Saga\Store\WorkflowId;
 use Throwable;
 
@@ -14,7 +15,7 @@ use Throwable;
  * so two workers never advance the same instance at once. It is a fast-path guard, not the only one;
  * the instance store's OCC `version` is the backstop if a step ever races past the fence.
  *
- * The fence carries a double contract: mutual exclusion AND the step's atomicity scope. It is three
+ * The fence carries a double contract: mutual exclusion AND the step's atomicity scope. It is four
  * adapter laws:
  *
  *  1. `$work` runs inside one atomic unit shared with the co-transactional group's connection for
@@ -25,6 +26,10 @@ use Throwable;
  *     transaction-scoped by nature.
  *
  *  3. Try-skip: never block; an occupied fence returns `false` and the caller's durable timer re-tries.
+ *
+ *  4. The unit runs under `READ COMMITTED`: the reads a step makes on its family are plain, and only a
+ *     per-statement snapshot lets a child committed a moment ago be counted. Any other effective level
+ *     is refused before the step runs, never argued about; the miss it would cause is silent.
  *
  * Consequence for "don't get locked in": a lock service alone such as a Redis lock is NOT a step unit of work,
  * since law 1 is unsatisfiable without the relational unit of work; an alternative RDBMS adapter is
@@ -39,6 +44,8 @@ interface SagaStepUnitOfWork
      *
      * @param  Closure():void  $work
      *
+     * @throws FenceIsolationRefused when the effective isolation level is not `READ COMMITTED`, before
+     *                               `$work` runs
      * @throws Throwable propagated from `$work`; the fence is released either way
      * @throws RuntimeException on a failure acquiring the fence or its transaction
      */

@@ -405,6 +405,7 @@ final class StorageFailureTranslationTest extends TestCase
             'workflow_type' => 'wf', 'correlation_id' => 'c-1', 'state_key' => 'await', 'status' => 'running',
             'vars' => $vars, 'retries' => '{"attempts":2}', 'compensations' => $compensations, 'context' => '{"actor":"cli"}',
             'version' => 7, 'generation' => 1, 'definition_version' => 5, 'state_version' => 4, 'retry_total' => 6, 'retimes' => 0, 'arms' => '{}', 'families' => '{}', 'parked' => $parked, 'started_at' => $startedAt,
+            'global_deadline_consumed_at' => null,
             'waived_at' => $waivedAt, 'paused_at' => null, 'paused_reason' => $pausedReason,
         ];
     }

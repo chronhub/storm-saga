@@ -50,6 +50,7 @@ final class SagaSchemaCatalog
             'started_at' => 'timestamp(6) with time zone not null',
             'updated_at' => 'timestamp(6) with time zone not null',
             'waived_at' => 'timestamp(6) with time zone null',
+            'global_deadline_consumed_at' => 'timestamp(6) with time zone null',
             'paused_at' => 'timestamp(6) with time zone null',
             'paused_reason' => 'text null',
             'parent_workflow_type' => 'text null',

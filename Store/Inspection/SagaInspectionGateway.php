@@ -65,7 +65,7 @@ final readonly class SagaInspectionGateway
             // living saga as executable while its whole type is held
             $sql = 'SELECT i.workflow_type, i.state_key, i.status, i.vars, i.retries, i.compensations, i.version, i.started_at,
                            i.updated_at, i.generation, i.definition_version, i.state_version, i.retry_total, i.retimes,
-                           i.waived_at, i.paused_at, i.paused_reason,
+                           i.waived_at, i.global_deadline_consumed_at, i.paused_at, i.paused_reason,
                            i.parent_workflow_type, i.parent_correlation_id, i.root_correlation_id,
                            EXISTS (SELECT 1 FROM workflow_pauses p WHERE p.workflow_type = i.workflow_type) AS type_paused
                     FROM workflow_instances i WHERE i.correlation_id = :corr';
@@ -90,6 +90,7 @@ final readonly class SagaInspectionGateway
                     definitionVersion: (int) $row['definition_version'],
                     retryTotal: (int) $row['retry_total'],
                     waivedAt: $row['waived_at'] !== null ? (string) $row['waived_at'] : null,
+                    globalDeadlineConsumedAt: $row['global_deadline_consumed_at'] !== null ? (string) $row['global_deadline_consumed_at'] : null,
                     retries: $this->decodeRetries($row['retries']),
                     compensations: $this->decodeCompensations($row['compensations']),
                     timers: $this->timers((string) $row['workflow_type'], $correlation),
@@ -179,7 +180,7 @@ final readonly class SagaInspectionGateway
             // the type freeze leaves NO stamp on its instances, it lives in workflow_pauses alone, so
             // without this the widest freeze of the surface is invisible in every listing
             'SELECT i.workflow_type, i.correlation_id, i.state_key, i.status, i.version, i.generation,
-                    i.definition_version, i.retry_total, i.started_at, i.updated_at, i.waived_at,
+                    i.definition_version, i.retry_total, i.started_at, i.updated_at, i.waived_at, i.global_deadline_consumed_at,
                     i.paused_at, i.parent_correlation_id,
                     EXISTS (SELECT 1 FROM workflow_pauses p WHERE p.workflow_type = i.workflow_type) AS type_paused
              FROM workflow_instances i'
@@ -204,6 +205,7 @@ final readonly class SagaInspectionGateway
                 startedAt: $r['started_at'] !== null ? (string) $r['started_at'] : null,
                 updatedAt: $r['updated_at'] !== null ? (string) $r['updated_at'] : null,
                 waivedAt: $r['waived_at'] !== null ? (string) $r['waived_at'] : null,
+                globalDeadlineConsumedAt: $r['global_deadline_consumed_at'] !== null ? (string) $r['global_deadline_consumed_at'] : null,
                 parentCorrelationId: $r['parent_correlation_id'] !== null ? (string) $r['parent_correlation_id'] : null,
                 pausedAt: $r['paused_at'] !== null ? (string) $r['paused_at'] : null,
                 typePaused: (bool) $r['type_paused'],

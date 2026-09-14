@@ -6,10 +6,14 @@ namespace Symfony\Component\DependencyInjection\Loader\Configurator;
 
 use Storm\Saga\Build\WorkflowBuilder;
 use Storm\Saga\Build\WorkflowRegistry;
+use Storm\Saga\Child\ChildCanceller;
+use Storm\Saga\Child\ChildSpawner;
+use Storm\Saga\Child\FamilyPoker;
 use Storm\Saga\CircuitBreaker\CircuitBreaker;
 use Storm\Saga\CircuitBreaker\CircuitBreakerStorage;
 use Storm\Saga\CircuitBreaker\Dbal\DbalCircuitBreakerStorage;
 use Storm\Saga\CircuitBreaker\InMemory\InMemoryCircuitBreakerStorage;
+use Storm\Saga\Console\AuditTimersCommand;
 use Storm\Saga\Console\InspectSagaCommand;
 use Storm\Saga\Console\InstallSagaCommand;
 use Storm\Saga\Console\ListSagasCommand;
@@ -18,16 +22,22 @@ use Storm\Saga\Console\RunTimersCommand;
 use Storm\Saga\Console\SagaCancelCommand;
 use Storm\Saga\Console\SagaChildrenCommand;
 use Storm\Saga\Console\SagaCleanupCommand;
-use Storm\Saga\Console\SagaRedriveCommand;
-use Storm\Saga\Console\SagaStateMigrateCommand;
 use Storm\Saga\Console\SagaPauseCommand;
+use Storm\Saga\Console\SagaRedriveCommand;
 use Storm\Saga\Console\SagaResumeCommand;
+use Storm\Saga\Console\SagaStateMigrateCommand;
 use Storm\Saga\Console\SagaUnparkCommand;
 use Storm\Saga\Console\SagaVersionsCommand;
+use Storm\Saga\Console\ValidateSagaCommand;
 use Storm\Saga\Engine\Canceller;
 use Storm\Saga\Engine\Compensator;
 use Storm\Saga\Engine\DeadlineEnforcer;
 use Storm\Saga\Engine\Engine;
+use Storm\Saga\Engine\FailedEffectSettler;
+use Storm\Saga\Engine\FamilyGate;
+use Storm\Saga\Engine\JoinSettler;
+use Storm\Saga\Engine\MachineRunner;
+use Storm\Saga\Engine\RaceSettler;
 use Storm\Saga\Engine\SagaEngine;
 use Storm\Saga\Engine\SagaFamilyTarget;
 use Storm\Saga\Engine\SagaOperator;
@@ -35,42 +45,34 @@ use Storm\Saga\Engine\SagaOutcomeDelivery;
 use Storm\Saga\Engine\SagaSignaller;
 use Storm\Saga\Engine\SagaStarter;
 use Storm\Saga\Engine\SagaTimerTarget;
-use Storm\Saga\Engine\FailedEffectSettler;
-use Storm\Saga\Engine\MachineRunner;
-use Storm\Saga\Engine\FamilyGate;
-use Storm\Saga\Engine\JoinSettler;
 use Storm\Saga\Engine\State\ActivityRunner;
 use Storm\Saga\Engine\State\FinalRunner;
 use Storm\Saga\Engine\State\ScheduleRunner;
 use Storm\Saga\Engine\State\TransitionSelector;
 use Storm\Saga\Engine\State\WaitRunner;
 use Storm\Saga\Engine\State\WaitVarExtractor;
-use Storm\Saga\Engine\RaceSettler;
 use Storm\Saga\Engine\StepCommitter;
 use Storm\Saga\Engine\StepExecutor;
 use Storm\Saga\Engine\StepLoader;
 use Storm\Saga\Engine\StepPerformer;
 use Storm\Saga\Engine\StepPolicy;
 use Storm\Saga\Engine\WaitEscalator;
-use Storm\Saga\Locking\SagaStepUnitOfWork;
 use Storm\Saga\Locking\Dbal\PgAdvisoryFence;
+use Storm\Saga\Locking\SagaStepUnitOfWork;
 use Storm\Saga\Outbox\Dbal\DbalWorkflowOutboxWriter;
+use Storm\Saga\Outbox\FailedWorkflowCommands;
 use Storm\Saga\Outbox\HopProtocol;
 use Storm\Saga\Outbox\SagaOutboxRelay;
-use Storm\Saga\Outbox\WorkflowOutbox;
-use Storm\Saga\Outbox\FailedWorkflowCommands;
 use Storm\Saga\Outbox\WorkflowCommandStore;
+use Storm\Saga\Outbox\WorkflowOutbox;
 use Storm\Saga\Outbox\WorkflowOutboxWriter;
 use Storm\Saga\Schedule\TimerRunner;
-use Storm\Saga\Child\ChildCanceller;
-use Storm\Saga\Child\FamilyPoker;
-use Storm\Saga\Child\ChildSpawner;
 use Storm\Saga\Semaphore\SemaphoreClient;
 use Storm\Saga\Semaphore\SemaphoreWorkflow;
 use Storm\Saga\Semaphore\SweepActivity;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
-use Storm\Saga\Store\DueTimerQueue;
 use Storm\Saga\Store\Dbal\DbalWorkflowTimerStore;
+use Storm\Saga\Store\DueTimerQueue;
 use Storm\Saga\Store\Inspection\SagaInspectionGateway;
 use Storm\Saga\Store\SagaMaintenanceReader;
 use Storm\Saga\Store\WorkflowFamilies;
@@ -103,7 +105,7 @@ return static function (ContainerConfigurator $container): void {
         ->args([tagged_locator('storm.saga.activity')]);
 
     $services->set(WorkflowRegistry::class)
-        ->factory([WorkflowRegistry::class, 'fromWorkflows'])
+        ->factory(WorkflowRegistry::fromWorkflows(...))
         ->args([tagged_iterator('storm.saga.workflow'), service(WorkflowBuilder::class)]);
 
     // Engine: pure core plus facade; EventResolver is bound by the bundle
@@ -207,6 +209,7 @@ return static function (ContainerConfigurator $container): void {
 
     // One-shot console drains; a worker loop runs them repeatedly, the same shape as storm:outbox:relay.
     $services->set(RunTimersCommand::class)->tag('console.command');
+    $services->set(AuditTimersCommand::class)->tag('console.command');
     $services->set(RelaySagaOutboxCommand::class)->tag('console.command');
 
     // storm:saga:install: the saga tables, opt-in and separate from storm:install since Saga is opt-in.
@@ -220,6 +223,10 @@ return static function (ContainerConfigurator $container): void {
 
     // storm:saga:versions: version-pinning purge view of versions by running counts; --check gates a deploy.
     $services->set(SagaVersionsCommand::class)->tag('console.command');
+
+    // storm:saga:validate: assembles every declared definition and reports all failures. The registry
+    // assembles on demand, so this is where a consuming application's CI gets the whole verdict back.
+    $services->set(ValidateSagaCommand::class)->tag('console.command');
 
     // storm:saga:cleanup, periodic maintenance: reconcile stranded sagas, the durable backstop for the
     // relay's non-durable post-commit settle signal, and prune terminal bookkeeping. Autowires the Engine.

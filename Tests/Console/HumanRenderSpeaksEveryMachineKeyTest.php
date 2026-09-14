@@ -62,6 +62,7 @@ final class HumanRenderSpeaksEveryMachineKeyTest extends TestCase
             'parent_correlation_id' => 'the `child` flag, the fact without the id',
             'paused_at' => 'the `paused` flag, the fact without the stamp',
             'waived_at' => 'the `waived` flag, the fact without the stamp',
+            'global_deadline_consumed_at' => 'the `cap-consumed` flag, the fact without the stamp',
             'type_paused' => 'the `paused(type)` flag',
         ],
         SagaSnapshot::class => [],
@@ -84,7 +85,7 @@ final class HumanRenderSpeaksEveryMachineKeyTest extends TestCase
         ],
         SagaSnapshot::class => [
             'workflow_type', 'state_key', 'status', 'version', 'started_at', 'definition_version',
-            'generation', 'retry_total', 'retimes', 'updated_at', 'waived_at', 'paused_at',
+            'generation', 'retry_total', 'retimes', 'updated_at', 'waived_at', 'global_deadline_consumed_at', 'paused_at',
             'paused_reason', 'type_paused', 'exposed', 'retries', 'compensations', 'timers', 'outbox',
             'parent_workflow_type', 'parent_correlation_id', 'root_correlation_id',
         ],

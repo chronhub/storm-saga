@@ -115,6 +115,11 @@ final readonly class WorkflowInstanceRow
          * @var array{state: string, event: class-string, cause: string|null}|null
          */
         public ?array $parked = null,
+        /**
+         * The global deadline already routed this instance into recovery. Preserved by every mover;
+         * independent of `waivedAt`, which identifies a handoff to reconciliation.
+         */
+        public ?PointInTime $globalDeadlineConsumedAt = null,
     ) {}
 
     /**
@@ -283,9 +288,10 @@ final readonly class WorkflowInstanceRow
     }
 
     /**
-     * The global cap was WAIVED at this retriable, gating resting point: everything preserved, the
-     * waive instant stamped. Set once and never cleared by any mover: the cap is spent for the
-     * instance's whole remaining life, and the sweep and straggler guards read it as such.
+     * An elapsed global cap hands this retriable gating wait to reconciliation, including when
+     * recovery routing already consumed the cap. Everything is preserved and the waive instant stamped.
+     * Set once and never cleared by any mover: the cap is spent for the instance's whole remaining
+     * life, and the sweep and straggler guards read it as such.
      */
     public function waived(PointInTime $at): self
     {
@@ -295,11 +301,11 @@ final readonly class WorkflowInstanceRow
     /**
      * Force out of the current state via the global deadline's `onGlobalTimeout` routing; still Running.
      */
-    public function forcedTo(string $stateKey): self
+    public function forcedTo(string $stateKey, ?PointInTime $globalDeadlineConsumedAt = null): self
     {
         // a forced exit ends the deadline's negotiation like any crossing: the retime budget resets,
         // and an owed crossing dies with the wait it was owed at
-        return clone ($this, ['stateKey' => $stateKey, 'status' => WorkflowStatus::Running, 'retimes' => 0, 'parked' => null]);
+        return clone ($this, ['stateKey' => $stateKey, 'status' => WorkflowStatus::Running, 'retimes' => 0, 'parked' => null, 'globalDeadlineConsumedAt' => $this->globalDeadlineConsumedAt ?? $globalDeadlineConsumedAt]);
     }
 
     /**

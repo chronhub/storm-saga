@@ -107,7 +107,8 @@ final readonly class JoinSettler
         if (! $wait instanceof WaitState) {
             return null; // defensive: the build proves the joining wait is a wait
         }
-        if ($wait->matcher !== null && ! ($wait->matcher)($event, $row->vars)) {
+        $matcherVars = $row->vars;
+        if ($wait->matcher !== null && ! ($wait->matcher)($event, $matcherVars)) {
             return null; // the wait's own matcher refuses it; the machine will Noop identically
         }
 

@@ -88,7 +88,7 @@ final readonly class DeadlineEnforcer
         }
 
         // drive from the onGlobalTimeout state; it runs: a Final completes, an activity executes, and so on
-        $working = $row->forcedTo($def->onGlobalTimeout);
+        $working = $row->forcedTo($def->onGlobalTimeout, $now);
         $run = $this->machine->run($def, $working, Stimulus::none(), $now, $causationId);
 
         $forced = new SagaTransitioned($type, $corr, $row->generation, $row->stateKey, $def->onGlobalTimeout);
@@ -107,8 +107,11 @@ final readonly class DeadlineEnforcer
      * every logged step for reconciliation, and drive nothing, never the confirmed-rollback or
      * forced-routing branches of `enforce()`. The saga becomes terminal and observable instead of
      * re-arming the global forever; a late outcome event, a dead-letter, or the recon backstop
-     * resolves the in-flight leg. A retriable gating wait never reaches here; `StepPolicy` skips the
-     * cap for it, so it re-arms forever instead.
+     * resolves the in-flight leg. A retriable gating wait reaches `waiveAtCap()` instead, which
+     * disarms both timers and hands off to reconciliation.
+     *
+     * A cap consumed by recovery routing has already announced `SagaGloballyTimedOut`; halting a
+     * later gating wait preserves that single announcement.
      *
      * Pure of persistence, like `enforce()`: returns the halted Rested run for the shell to apply.
      */
@@ -122,9 +125,13 @@ final readonly class DeadlineEnforcer
             ? []
             : [new SagaCompensationSkipped($type, $corr, $row->generation, $this->compensator->stepKeys($row->compensations))];
 
+        $timedOut = $row->globalDeadlineConsumedAt === null
+            ? [new SagaGloballyTimedOut($type, $corr, $row->generation, $row->stateKey)]
+            : [];
+
         return new Rested(
             $row->halted(),
-            [new SagaGloballyTimedOut($type, $corr, $row->generation, $row->stateKey), new SagaHalted($type, $corr, $row->generation, $row->stateKey), ...$skipped],
+            [...$timedOut, new SagaHalted($type, $corr, $row->generation, $row->stateKey), ...$skipped],
             $cancels,
         );
     }

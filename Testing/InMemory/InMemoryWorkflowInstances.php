@@ -133,11 +133,6 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
         unset($this->state->instances[$this->state->instanceKey($id)]);
     }
 
-    // The page default carries two arithmetic mutants that no honest unit can reach: telling 1000
-    // from 999 or 1001 needs a thousand stranded rows in a fixture, and a suite that built them would
-    // be measuring its own setup. The bound that MATTERS, that the page is limit-first and ordered,
-    // is held by its own law. Left visible rather than ignored, the sibling mutants of this signature
-    // being killed.
     public function strandedByFailedEffect(int $limit = 1000): array
     {
         $pairs = [];
@@ -370,6 +365,7 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
             $pausedAt,
             $pausedReason,
             $row->parked,
+            globalDeadlineConsumedAt: $row->globalDeadlineConsumedAt,
         );
     }
 

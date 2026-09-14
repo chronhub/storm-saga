@@ -58,6 +58,27 @@ trait SagaStoreContractLaws
     abstract protected function ageInstance(WorkflowId $id, int $seconds): void;
 
     #[Test]
+    public function a_consumed_global_deadline_survives_store_writes(): void
+    {
+        $instances = $this->contractInstances();
+        $id = new WorkflowId('law', 'c-consumed');
+        $at = $this->contractNow()->subSeconds(5);
+        $instances->create($this->row('law', 'c-consumed'));
+        $row = $instances->find($id);
+        $this->assertNotNull($row);
+        $this->assertNull($row->globalDeadlineConsumedAt);
+        $instances->update($row->forcedTo('recover', $at));
+        $this->assertSame($at->toString(), $instances->find($id)?->globalDeadlineConsumedAt?->toString());
+        $this->assertTrue($instances->pauseInstance($id, 'window'));
+        $this->assertSame($at->toString(), $instances->find($id)->globalDeadlineConsumedAt->toString());
+        $instances->resumeInstance($id);
+        $this->assertSame($at->toString(), $instances->find($id)->globalDeadlineConsumedAt->toString());
+        $instances->delete($id);
+        $instances->create($this->row('law', 'c-consumed'), CorrelationReuse::Allow);
+        $this->assertNull($instances->find($id)?->globalDeadlineConsumedAt);
+    }
+
+    #[Test]
     public function a_zero_quiet_window_sweeps_any_aged_waived_row(): void
     {
         // the sweep contract is "untouched for at least the window": zero is a legal window a

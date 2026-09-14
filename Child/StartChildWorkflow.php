@@ -23,6 +23,7 @@ use Storm\Message\HasConstructablePayload;
  */
 final class StartChildWorkflow implements SerializablePayload
 {
+    /** @use HasConstructablePayload<array{parent_workflow_type: string, parent_correlation_id: string, child_workflow_type: string, slot: string, vars: array<string, mixed>}> */
     use HasConstructablePayload;
 
     public string $parentWorkflowType { get => (string) $this->payload['parent_workflow_type']; }

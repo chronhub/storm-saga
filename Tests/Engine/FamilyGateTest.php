@@ -153,12 +153,12 @@ final class FamilyGateTest extends TestCase
      */
     private function gate(array $counts): FamilyGate
     {
-        $instances = new class($counts) implements WorkflowFamilies
+        $instances = new readonly class($counts) implements WorkflowFamilies
         {
             /**
              * @param  array<string, array{int, int}>  $counts
              */
-            public function __construct(private readonly array $counts) {}
+            public function __construct(private array $counts) {}
 
             public function spawnedMembers(string $parentCorrelationId, string $family): int
             {

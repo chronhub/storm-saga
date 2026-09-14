@@ -28,6 +28,7 @@ use Storm\Saga\Attributes\Spawns;
  */
 final class PokeParentFamily implements SerializablePayload
 {
+    /** @use HasConstructablePayload<array{parent_workflow_type: string, parent_correlation_id: string, child_workflow_type: string, child_correlation_id: string}> */
     use HasConstructablePayload;
 
     public string $parentWorkflowType { get => (string) $this->payload['parent_workflow_type']; }

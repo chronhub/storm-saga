@@ -76,6 +76,11 @@ final readonly class ReachabilityRules
      * or the cap: the engine owns its timeout edge, so it declares no deadline of its own. Every other wait
      * takes the deadline or the cap, never a heartbeat, which escalates a step nobody awaits.
      *
+     * A wait reachable from `onGlobalTimeout` cannot rely on the cap, which recovery has already
+     * consumed. It declares its own liveness even when the workflow has a cap. Reachability includes
+     * the target itself and every declared transition, including guarded edges and returns to the
+     * main graph; guards cannot prove that a recovery path is impossible.
+     *
      * One shape is exempt, and it is DERIVED rather than declared: a wait named by `#[Spawns(awaitedBy:)]`
      * awaits a CHILD, whose own horizon concludes it and delivers the awaited event. A second clock in the
      * parent would race the child rather than protect it, so the spawn declaration IS the exemption and
@@ -97,25 +102,31 @@ final readonly class ReachabilityRules
      * @param  array<string, State>  $states
      * @param  list<string>  $awaitedBySpawn  the wait keys a `#[Spawns]` names, whose horizon is the child's
      *
-     * @throws InvalidWorkflowDefinition when a wait can neither ping nor expire and the workflow has no cap
+     * @throws InvalidWorkflowDefinition when a wait can neither ping nor expire and no unspent cap covers it
      */
-    public function everyWaitDeclaresLiveness(string $workflow, array $states, array $awaitedBySpawn, ?int $globalTimeout): void
+    public function everyWaitDeclaresLiveness(string $workflow, array $states, array $awaitedBySpawn, ?int $globalTimeout, ?string $onGlobalTimeout = null): void
     {
-        if ($globalTimeout !== null) {
-            return; // the cap bounds every resting point; liveness is covered workflow-wide
-        }
+        $recoveryStates = $onGlobalTimeout === null ? [] : $this->reachableFrom($onGlobalTimeout, $states);
 
         foreach ($states as $state) {
             if (! $state instanceof WaitState || $state->timeout !== null) {
                 continue;
             }
 
+            if ($globalTimeout !== null && ! isset($recoveryStates[$state->key])) {
+                continue;
+            }
+
             if (EffectGating::gates($states, $state->key)) {
-                throw InvalidWorkflowDefinition::gatingWaitWithoutLiveness($state->key, $workflow);
+                throw $globalTimeout === null
+                    ? InvalidWorkflowDefinition::gatingWaitWithoutLiveness($state->key, $workflow)
+                    : InvalidWorkflowDefinition::recoveryGatingWaitWithoutLiveness($state->key, $workflow);
             }
 
             if (! in_array($state->key, $awaitedBySpawn, true)) {
-                throw InvalidWorkflowDefinition::waitWithoutLiveness($state->key, $workflow);
+                throw $globalTimeout === null
+                    ? InvalidWorkflowDefinition::waitWithoutLiveness($state->key, $workflow)
+                    : InvalidWorkflowDefinition::recoveryWaitWithoutLiveness($state->key, $workflow);
             }
         }
     }
@@ -146,6 +157,29 @@ final readonly class ReachabilityRules
                 throw InvalidWorkflowDefinition::compensatableStateInCycle($state->key, $workflow);
             }
         }
+    }
+
+    /**
+     * @param  array<string, State>  $states
+     * @return array<string, true>
+     */
+    private function reachableFrom(string $origin, array $states): array
+    {
+        $stack = [$origin];
+        $seen = [];
+
+        while ($stack !== []) {
+            $key = array_pop($stack);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            foreach ($this->successorsOf($key, $states) as $next) {
+                $stack[] = $next;
+            }
+        }
+
+        return $seen;
     }
 
     /**

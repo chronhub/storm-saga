@@ -8,12 +8,14 @@ use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception;
 use Doctrine\DBAL\ParameterType;
+use Psr\Log\LoggerInterface;
 use Storm\Message\Header;
 use Storm\Saga\Engine\EffectEvidence;
 use Storm\Saga\Engine\Engine;
 use Storm\Serializer\MessageSerializer;
 use Storm\Serializer\SerializedMessage;
 use Storm\Support\Error\AuditDigest;
+use Storm\Support\Error\TransientFailure;
 use Throwable;
 
 /**
@@ -47,8 +49,14 @@ use Throwable;
  * - Published: marked `published`, in the same transaction, batched; it lingers as the command trail
  *   and the settle's pairing input until the cleanup reaps it by age.
  *
- * - Transient, when publish threw: bump `attempts`, set `next_attempt_at` with exponential back-off;
- *   after `maxAttempts` it is dead-lettered.
+ * - Transient, when publish threw: bump `attempts`, set `next_attempt_at` with exponential back-off,
+ *   leave the row `pending`, and report the outage after the commit as
+ *   {@see SagaOutboxDrainIncomplete}, so a scheduler reads a non-zero exit rather than a clean run
+ *   over a stopped command lane. After `maxAttempts` the row is dead-lettered instead, unless
+ *   {@see \Storm\Support\Error\TransientFailure} finds the transport or the database named in the
+ *   cause chain: the budget measures the BROKER's health, and a dead-lettered command is one no relay
+ *   sends again, so spending it on an outage would settle or compensate a saga whose command was only
+ *   ever withheld.
  *
  * - Permanent: dead-lettered now, when the row can't be decoded due to a corrupt payload or unknown
  *   type, or when `publish()` threw an `UnrecoverableCommandDispatch` for no handler or an invalid
@@ -84,6 +92,12 @@ final readonly class SagaOutboxRelay
          * bundle autowires it in production. Signaled AFTER the drain transaction commits.
          */
         private ?Engine $engine = null,
+        /**
+         * Where a failed dispatch leaves its line, `storm.saga.publish_failed` at warning with the
+         * workflow, the correlation, the attempt spent and the budget: the outage is otherwise a
+         * non-zero exit and two columns on a row. Null logs nothing, for standalone use.
+         */
+        private ?LoggerInterface $logger = null,
     ) {}
 
     /**
@@ -94,6 +108,9 @@ final readonly class SagaOutboxRelay
      *                   clean state before the row's bookkeeping write, rather than aborting the batch; a
      *                   row whose bookkeeping write still fails against that clean state is skipped and
      *                   left `pending`, never re-thrown, so ONE unrecoverable row costs a slot, not the drain
+     * @throws SagaOutboxDrainIncomplete on a transient dispatch failure, thrown after committing the
+     *                                   progress made so far, which it carries in its `progress`, and after the
+     *                                   dead-letters' settles have run; the first failure is its `previous`
      * @throws Throwable when any other exception is thrown by the transaction's commit; a post-commit
      *                   settle's own failure, its storage, version, clock and serialization tails
      *                   included, never escapes the per-item isolation, the reconcile backstop
@@ -104,7 +121,9 @@ final readonly class SagaOutboxRelay
         /** @var list<array{0: string, 1: string|null}> $deadLettered correlationId and sealed messageId pairs, signaled after the drain tx commits */
         $deadLettered = [];
 
-        $result = $this->connection->transactional(function (Connection $connection) use ($batch, &$deadLettered): SagaOutboxDrainResult {
+        $transient = null;
+
+        $result = $this->connection->transactional(function (Connection $connection) use ($batch, &$deadLettered, &$transient): SagaOutboxDrainResult {
             $rows = $connection->fetchAllAssociative(
                 /** @lang PostgreSQL */
                 "SELECT id, workflow_type, correlation_id, bus, header, content, attempts
@@ -171,14 +190,18 @@ final readonly class SagaOutboxRelay
                     } catch (Throwable $e) {
                         $connection->rollbackSavepoint($savepoint);
                         $next = $attempts + 1;
-                        if ($next >= $this->maxAttempts) {
-                            // publish threw, and under a SYNC transport publish IS the handler: nothing here
-                            // proves the effect never landed, so the settle must not assume it did not
+                        if ($next >= $this->maxAttempts && ! TransientFailure::behind($e)) {
+                            // Out of attempts, and nothing in the cause chain names the transport or the
+                            // database: the failure is the command's own. Publish threw, and under a SYNC
+                            // transport publish IS the handler, so nothing here proves the effect never
+                            // landed and the settle must not assume it did not.
                             $this->deadLetter($connection, $id, $next, $e, EffectEvidence::Unknown);
                             $deadLettered[] = [(string) $row['correlation_id'], $this->sealedMessageId((string) $row['header'])];
                             $failed++;
                         } else {
                             $this->retryLater($connection, $id, $next, $e);
+                            $this->logPublishFailure((string) $row['workflow_type'], (string) $row['correlation_id'], $next, $e);
+                            $transient ??= $e; // remember the first outage to surface after the commit
                         }
 
                         continue;
@@ -223,6 +246,14 @@ final readonly class SagaOutboxRelay
                     // next pass re-derives this very settle and reports the poison loud there
                 }
             }
+        }
+
+        if ($transient !== null) {
+            // Progress + the bumped attempts are committed, and the settles have run; now surface the
+            // outage so the run retries, carrying the committed counts; fail forward, the work done
+            // must show. Last, after the settles, so an outage never withholds a dead letter's own
+            // compensation.
+            throw SagaOutboxDrainIncomplete::after($result, $transient);
         }
 
         return $result;
@@ -339,5 +370,26 @@ final readonly class SagaOutboxRelay
         $seconds = $this->backoffBaseSeconds * (2 ** ($attempts - 1));
 
         return max(1, (int) min($this->backoffMaxSeconds, $seconds));
+    }
+
+    // fail-open, as every observation around a commit: a logger that throws must not undo the back-off
+    private function logPublishFailure(string $workflowType, string $correlationId, int $attempts, Throwable $failure): void
+    {
+        if ($this->logger === null) {
+            return;
+        }
+
+        try {
+            $this->logger->warning('storm.saga.publish_failed', [
+                'relay' => 'saga',
+                'workflow_type' => $workflowType,
+                'correlation_id' => $correlationId,
+                'attempts' => $attempts,
+                'max_attempts' => $this->maxAttempts,
+                'error' => AuditDigest::digest($failure),
+            ]);
+        } catch (Throwable) {
+            // the observation may lose its line; it may never cost the relay its progress
+        }
     }
 }

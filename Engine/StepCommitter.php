@@ -161,7 +161,8 @@ final readonly class StepCommitter
         }
 
         try {
-            ($def->stateValidator)($row->vars);
+            $validatorVars = $row->vars;
+            ($def->stateValidator)($validatorVars);
         } catch (Throwable $cause) {
             throw WorkflowStateRejected::at($row->workflowType, $row->correlationId, $row->stateKey, $cause);
         }

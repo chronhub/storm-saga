@@ -119,7 +119,7 @@ final readonly class DefinitionValidator
         $this->time->heartbeatWaitsMustGate($workflow, $states);
         $this->time->retriableRequiresHeartbeat($workflow, $states);
         $this->time->scheduleStatesHaveAScheduleEdge($workflow, $states);
-        $this->reachability->everyWaitDeclaresLiveness($workflow, $states, $awaitedBySpawn, $globalTimeout);
+        $this->reachability->everyWaitDeclaresLiveness($workflow, $states, $awaitedBySpawn, $globalTimeout, $onGlobalTimeout);
         $this->effects->compensableGatingStepsDeclareConfirmedBy($workflow, $states);
         $this->reachability->compensatableStatesAvoidCycles($workflow, $states);
         $this->reachability->scheduleEdgesKeepAnUnguardedPath($workflow, $states);

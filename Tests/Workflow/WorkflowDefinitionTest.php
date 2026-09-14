@@ -6,6 +6,8 @@ namespace Storm\Saga\Tests\Workflow;
 
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
+use stdClass;
 use Storm\Saga\Exception\UnknownState;
 use Storm\Saga\Tests\Fixture\RecordingActivity;
 use Storm\Saga\Workflow\ActivityResult;
@@ -16,6 +18,33 @@ use Storm\Saga\Workflow\WorkflowDefinition;
 
 final class WorkflowDefinitionTest extends TestCase
 {
+    #[Test]
+    public function a_cycle_in_one_branch_does_not_hide_an_event_in_another_branch(): void
+    {
+        $start = new ActivityState('start', new RecordingActivity(ActivityResult::success()), transitions: [
+            new \Storm\Saga\Workflow\Transition(\Storm\Saga\Attributes\OnTrigger::Success, 'target'),
+            new \Storm\Saga\Workflow\Transition(\Storm\Saga\Attributes\OnTrigger::Failure, 'cycle'),
+        ]);
+        $cycle = new \Storm\Saga\Workflow\WaitState('cycle', transitions: [new \Storm\Saga\Workflow\Transition(\Storm\Saga\Attributes\OnTrigger::Event, 'cycle')]);
+        $target = new \Storm\Saga\Workflow\WaitState('target', eventClasses: [stdClass::class]);
+        $definition = new WorkflowDefinition('branches', ['start' => $start, 'cycle' => $cycle, 'target' => $target], 'start');
+        $this->assertTrue($definition->canStillAccept('start', stdClass::class));
+    }
+
+    #[Test]
+    public function reachability_terminates_on_a_cycle_without_discarding_a_reachable_event(): void
+    {
+        $wait = new \Storm\Saga\Workflow\WaitState(
+            'await',
+            eventClasses: [stdClass::class],
+            transitions: [new \Storm\Saga\Workflow\Transition(\Storm\Saga\Attributes\OnTrigger::Event, 'await')],
+        );
+        $definition = new WorkflowDefinition('cycle', ['await' => $wait], 'await');
+        $this->assertFalse($definition->canStillAccept('await', RuntimeException::class));
+        $this->assertTrue($definition->canStillAccept('await', stdClass::class));
+        $this->assertFalse($definition->canStillAccept('unknown', stdClass::class));
+    }
+
     #[Test]
     public function exposes_its_states_by_key(): void
     {

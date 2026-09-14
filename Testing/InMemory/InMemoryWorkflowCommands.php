@@ -82,21 +82,11 @@ final readonly class InMemoryWorkflowCommands implements WorkflowOutboxWriter
             || $row['status'] !== OutboxStatus::Failed->value || $row['issuedFromState'] === '') {
             return null;
         }
-
-        $aliveSiblings = false;
-        foreach ($this->state->commands as $sibling) {
-            if ($sibling['id'] !== $row['id']
-                && $sibling['correlationId'] === $row['correlationId']
-                && $sibling['generation'] === $row['generation']
-                && $sibling['issuedAtVersion'] === $row['issuedAtVersion']
-                && in_array($sibling['status'], [OutboxStatus::Pending->value, OutboxStatus::Published->value], true)) {
-                $aliveSiblings = true;
-                // @infection-ignore-all; equivalent, break to continue: the flag is written `true` at
-                // this one site and never back, so the siblings behind it can only rewrite the value
-                // it already holds
-                break;
-            }
-        }
+        $aliveSiblings = array_any($this->state->commands, fn ($sibling) => $sibling['id'] !== $row['id']
+            && $sibling['correlationId'] === $row['correlationId']
+            && $sibling['generation'] === $row['generation']
+            && $sibling['issuedAtVersion'] === $row['issuedAtVersion']
+            && in_array($sibling['status'], [OutboxStatus::Pending->value, OutboxStatus::Published->value], true));
 
         return new EffectProvenance(
             $row['issuedFromState'],

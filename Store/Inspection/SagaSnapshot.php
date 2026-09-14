@@ -69,6 +69,7 @@ final readonly class SagaSnapshot
          * in `workflow_pauses` alone and gates births as well as steps.
          */
         public bool $typePaused = false,
+        public ?string $globalDeadlineConsumedAt = null,
     ) {}
 
     /**
@@ -96,6 +97,7 @@ final readonly class SagaSnapshot
             'retry_total' => $this->retryTotal,
             'retimes' => $this->retimes,
             'waived_at' => $this->waivedAt,
+            'global_deadline_consumed_at' => $this->globalDeadlineConsumedAt,
             'retries' => $this->retries,
             'exposed' => $this->exposed,
             'compensations' => array_map(static fn (CompensationRecord $c): array => $c->toArray(), $this->compensations),

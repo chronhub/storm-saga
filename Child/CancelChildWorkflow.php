@@ -18,6 +18,7 @@ use Storm\Message\HasConstructablePayload;
  */
 final class CancelChildWorkflow implements SerializablePayload
 {
+    /** @use HasConstructablePayload<array{parent_workflow_type: string, parent_correlation_id: string, child_workflow_type: string, child_correlation_id: string, reason: string|null, force: bool}> */
     use HasConstructablePayload;
 
     public string $parentWorkflowType { get => (string) $this->payload['parent_workflow_type']; }

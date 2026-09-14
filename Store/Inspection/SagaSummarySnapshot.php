@@ -40,13 +40,14 @@ final readonly class SagaSummarySnapshot
          * the surface and the one an instance stamp cannot reveal.
          */
         public bool $typePaused = false,
+        public ?string $globalDeadlineConsumedAt = null,
     ) {}
 
     /**
      * The machine shape, snake_case on the wire: the same contract the console serves with `--json`
      * and the ops HTTP surface serves as a resource, so a script reads one format wherever it looks.
      *
-     * @return array{workflow_type: string, correlation_id: string, state_key: string, status: string, version: int, generation: int, definition_version: int, retry_total: int, started_at: string|null, updated_at: string|null, waived_at: string|null, parent_correlation_id: string|null, paused_at: string|null, type_paused: bool}
+     * @return array{workflow_type: string, correlation_id: string, state_key: string, status: string, version: int, generation: int, definition_version: int, retry_total: int, started_at: string|null, updated_at: string|null, waived_at: string|null, parent_correlation_id: string|null, paused_at: string|null, type_paused: bool, global_deadline_consumed_at: string|null}
      */
     public function toArray(): array
     {
@@ -62,6 +63,7 @@ final readonly class SagaSummarySnapshot
             'started_at' => $this->startedAt,
             'updated_at' => $this->updatedAt,
             'waived_at' => $this->waivedAt,
+            'global_deadline_consumed_at' => $this->globalDeadlineConsumedAt,
             'paused_at' => $this->pausedAt,
             'type_paused' => $this->typePaused,
             'parent_correlation_id' => $this->parentCorrelationId,

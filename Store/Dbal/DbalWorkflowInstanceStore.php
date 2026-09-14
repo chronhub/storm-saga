@@ -52,7 +52,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         return $this->guard(function () use ($id): ?WorkflowInstanceRow {
             $row = $this->connection->fetchAssociative(
                 /** @lang PostgreSQL */
-                'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, waived_at, paused_at, paused_reason
+                'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE workflow_type = :type AND correlation_id = :corr',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId],
             );
@@ -75,7 +75,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         return $this->guard(function () use ($correlationId): ?WorkflowInstanceRow {
             $row = $this->connection->fetchAssociative(
                 /** @lang PostgreSQL */
-                'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, waived_at, paused_at, paused_reason
+                'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE correlation_id = :corr LIMIT 1',
                 ['corr' => $correlationId],
             );
@@ -103,9 +103,9 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
 
             $this->connection->executeStatement(
                 /** @lang PostgreSQL */
-                'INSERT INTO workflow_instances (workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, waived_at)
+                'INSERT INTO workflow_instances (workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at)
                  VALUES (:type, :corr, :state, :status, CAST(:vars AS jsonb), CAST(:retries AS jsonb), CAST(:compensations AS jsonb), CAST(:context AS jsonb), :version, :generation, :def_version, :state_version, :retry_total, :retimes, CAST(:arms AS jsonb), CAST(:families AS jsonb), CAST(:parked AS jsonb),
-                         COALESCE(CAST(:started_at AS timestamptz), clock_timestamp()), CAST(:waived_at AS timestamptz))',
+                         COALESCE(CAST(:started_at AS timestamptz), clock_timestamp()), CAST(:global_deadline_consumed_at AS timestamptz), CAST(:waived_at AS timestamptz))',
                 [...$this->columns($row), 'started_at' => $row->startedAt?->toString(), 'def_version' => $row->definitionVersion, 'generation' => $generation],
                 ['version' => ParameterType::INTEGER, 'def_version' => ParameterType::INTEGER, 'state_version' => ParameterType::INTEGER, 'retry_total' => ParameterType::INTEGER, 'generation' => ParameterType::INTEGER],
             );
@@ -159,7 +159,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             'UPDATE workflow_instances
              SET state_key = :state, status = :status, vars = CAST(:vars AS jsonb),
                  retries = CAST(:retries AS jsonb), compensations = CAST(:compensations AS jsonb), context = CAST(:context AS jsonb),
-                 retry_total = :retry_total, retimes = :retimes, arms = CAST(:arms AS jsonb), families = CAST(:families AS jsonb), parked = CAST(:parked AS jsonb), waived_at = CAST(:waived_at AS timestamptz), state_version = :state_version, version = version + 1, updated_at = clock_timestamp()
+                 retry_total = :retry_total, retimes = :retimes, arms = CAST(:arms AS jsonb), families = CAST(:families AS jsonb), parked = CAST(:parked AS jsonb), global_deadline_consumed_at = CAST(:global_deadline_consumed_at AS timestamptz), waived_at = CAST(:waived_at AS timestamptz), state_version = :state_version, version = version + 1, updated_at = clock_timestamp()
              WHERE workflow_type = :type AND correlation_id = :corr AND version = :version',
             $this->columns($row),
             ['version' => ParameterType::INTEGER, 'retry_total' => ParameterType::INTEGER, 'state_version' => ParameterType::INTEGER],
@@ -215,7 +215,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         return $this->guard(function () use ($quietForSeconds, $limit): array {
             $rows = $this->connection->fetchAllAssociative(
                 /** @lang PostgreSQL */
-                "SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, waived_at, paused_at, paused_reason
+                "SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances
                  WHERE status = 'running' AND waived_at IS NOT NULL
                    AND updated_at < now() - (CAST(:quiet AS bigint) * interval '1 second')
@@ -408,7 +408,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
                 // FOR SHARE, never FOR UPDATE: siblings born concurrently must not serialize against
                 // each other, only against the parent's settle, which needs the row exclusively.
                 /** @lang PostgreSQL */
-                'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, waived_at, paused_at, paused_reason
+                'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE correlation_id = :corr LIMIT 1 FOR SHARE',
                 ['corr' => $correlationId],
             );
@@ -422,7 +422,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         return $this->guard(function () use ($parentCorrelationId): array {
             $rows = $this->connection->fetchAllAssociative(
                 /** @lang PostgreSQL */
-                "SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, waived_at, paused_at, paused_reason
+                "SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE parent_correlation_id = :parent AND status = 'running' ORDER BY correlation_id",
                 ['parent' => $parentCorrelationId],
             );
@@ -558,6 +558,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             definitionVersion: (int) $row['definition_version'],
             retryTotal: (int) $row['retry_total'],
             generation: (int) $row['generation'],
+            globalDeadlineConsumedAt: $row['global_deadline_consumed_at'] === null ? null : PointInTime::fromStorage((string) $row['global_deadline_consumed_at']),
             waivedAt: $row['waived_at'] === null ? null : PointInTime::fromStorage((string) $row['waived_at']),
             stateVersion: (int) $row['state_version'],
             retimes: (int) $row['retimes'],
@@ -621,6 +622,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             // the crossing an indexed family's gate rested and owes back; NULL when nothing is owed,
             // which is every row outside that one wait, so the column stays empty in the common case
             'parked' => $row->parked === null ? null : json_encode($row->parked, JSON_THROW_ON_ERROR),
+            'global_deadline_consumed_at' => $row->globalDeadlineConsumedAt?->toString(),
             'waived_at' => $row->waivedAt?->toString(),
             // threaded by every step mover, bumped only by the migration chain; bound on INSERT and
             // UPDATE alike so a migrated bag and its version land in the same write

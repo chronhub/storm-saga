@@ -118,6 +118,9 @@ final readonly class StepLoader
      * deadline is stale only when a live future row exists; an absent row still drives, because the
      * fired global is trusted even when its row was lost, the policy's documented promise.
      *
+     * A schedule signal must also carry the live slot instant. A different instant belongs to an
+     * already consumed slot even when the next slot is due, so replaying it would overcount catch-up.
+     *
      * @throws SagaStorageFailure when the saga storage fails, with driver failures wrapped by the adapter
      */
     public function timerSignalIsStale(WorkflowId $id, Signal $signal, PointInTime $now): bool
@@ -137,6 +140,10 @@ final readonly class StepLoader
         $liveFireAt = $this->timers->fireAt($id, $stateKey, $kind);
         if ($liveFireAt === null) {
             return $kind !== TimerKind::Global; // pinned kinds: a phantom copy; global: the fired timer is trusted
+        }
+
+        if ($kind === TimerKind::Schedule && ($signal->scheduleDueAt === null || ! $signal->scheduleDueAt->equals($liveFireAt))) {
+            return true;
         }
 
         return $liveFireAt->isAfter($now); // re-armed past the claim, so the copy is a straggler

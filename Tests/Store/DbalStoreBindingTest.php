@@ -57,6 +57,7 @@ final class DbalStoreBindingTest extends TestCase
                         'arms' => '{}', // the per-join arrival ledgers, empty as the object shape
                         'families' => '{}', // the per-family expected member counts, same discipline
                         'parked' => null, // the crossing a family gate owes back, absent on a birth and on every row outside that wait
+                        'global_deadline_consumed_at' => null,
                         'waived_at' => null, // the waived-cap trace, stamped by the waive, threaded ever after
                         'state_version' => 2, // the data-shape axis: birth stamp here, the migration chain's bump on UPDATE
                         'started_at' => null,

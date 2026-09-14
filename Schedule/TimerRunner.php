@@ -12,6 +12,7 @@ use Storm\Contracts\Serializer\SerializationExceptionContract;
 use Storm\Saga\Engine\Engine;
 use Storm\Saga\Engine\SagaTimerTarget;
 use Storm\Saga\Exception\MissingAsyncTimeout;
+use Storm\Saga\Exception\SagaAnnouncementFailed;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Exception\UnknownState;
@@ -80,6 +81,10 @@ final readonly class TimerRunner
      *
      * Failure discipline, per row:
      *
+     *  - An announcement failure after the unit of work returns propagates without timer bookkeeping.
+     *    The step may already have consumed or rearmed its timer; the listener's failure is not a
+     *    failed drive and must not spend the fresh timer's budget. Remaining claims retry by lease.
+     *
      *  - A permanent failure, where the timer names a workflow or pinned version no longer registered, a
      *    purge that outran `storm:saga:versions --check`, PARKS the row immediately and the batch
      *    CONTINUES: the row can never drive, so retrying it would crash-loop the daemon while its
@@ -102,6 +107,7 @@ final readonly class TimerRunner
      *
      * @param  positive-int  $batch
      *
+     * @throws SagaAnnouncementFailed when a listener fails after the driven unit of work returns
      * @throws SagaStorageFailure when the saga storage fails claiming the due rows or driving a step
      * @throws InvalidDateTimeException when the claim's lease cutoff / a timer instant cannot be derived
      * @throws StaleWorkflowInstance when a driven step's OCC update loses to a competing step
@@ -126,6 +132,9 @@ final readonly class TimerRunner
                     TimerKind::Schedule => $this->engine->schedule($timer->workflowType, $timer->correlationId, $timer->stateKey, $timer->fireAt),
                     TimerKind::Global => $this->engine->globalTimeout($timer->workflowType, $timer->correlationId),
                 };
+            } catch (SagaAnnouncementFailed $e) {
+                // The step returned before its listener failed; leave its committed timer state alone.
+                throw $e;
             } catch (WorkflowNotFound|WorkflowVersionNotFound $e) {
                 // permanent: orphaned by a purge; this row can never drive; park it and free the batch
                 $this->timers->park($timer->id, AuditDigest::digest($e));

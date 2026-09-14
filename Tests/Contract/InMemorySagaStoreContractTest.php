@@ -45,6 +45,66 @@ final class InMemorySagaStoreContractTest extends TestCase
     }
 
     #[Test]
+    public function the_default_stranded_page_returns_one_thousand_effects(): void
+    {
+        $id = new WorkflowId('law', 'many-failures');
+        $this->contractInstances()->create($this->row('law', 'many-failures'));
+        $commands = new InMemoryWorkflowCommands($this->state, new DefaultMessageSerializer, $this->clock);
+        for ($i = 0; $i < 1001; $i++) {
+            $messageId = sprintf('failed-%04d', $i);
+            $commands->write($id, $this->sealed($messageId), 'await', 0, 1);
+            $commands->markPublished($messageId);
+            $commands->markFailed('many-failures', $messageId, 'refused');
+        }
+        $page = $this->contractInstances()->strandedByFailedEffect();
+        $this->assertCount(1000, $page);
+        $this->assertSame(['many-failures', 'failed-0000'], $page[0]);
+        $this->assertSame(['many-failures', 'failed-0999'], $page[999]);
+    }
+
+    #[Test]
+    public function an_absent_timer_has_no_deadline_and_a_type_freeze_holds_due_timers(): void
+    {
+        $instances = $this->contractInstances();
+        $timers = $this->contractTimers();
+        $id = new WorkflowId('frozen', 'timer');
+        $this->assertNull($timers->fireAt($id, 'await', TimerKind::Timeout));
+        $instances->create($this->row('frozen', 'timer'));
+        $timers->arm($id, 'await', TimerKind::Timeout, $this->clock->now());
+        $instances->pauseType('frozen', 'maintenance');
+        $this->assertSame([], $timers->claimDue(10, $this->clock->now()));
+        $instances->resumeType('frozen');
+        $this->assertCount(1, $timers->claimDue(10, $this->clock->now()));
+    }
+
+    #[Test]
+    public function an_unencodable_state_is_refused_before_birth(): void
+    {
+        $instances = $this->contractInstances();
+        $row = WorkflowInstanceRow::fresh(new WorkflowId('invalid', 'utf8'), 'await', ['invalid' => "\xFF"], [], $this->clock->now(), 1);
+        $this->expectException(\Storm\Saga\Exception\SagaStorageFailure::class);
+        try {
+            $instances->create($row);
+        } finally {
+            $this->assertNull($instances->find(new WorkflowId('invalid', 'utf8')));
+        }
+    }
+
+    #[Test]
+    public function a_pending_command_does_not_strand_its_instance(): void
+    {
+        $this->contractInstances()->create($this->row('law', 'pending'));
+        $this->contractCommands()->write(new WorkflowId('law', 'pending'), $this->sealed('pending-message'), 'await', 0, 1);
+        $this->assertSame([], $this->contractInstances()->strandedByFailedEffect());
+        $commands = new InMemoryWorkflowCommands($this->state, new DefaultMessageSerializer, $this->clock);
+        $this->contractInstances()->create($this->row('law', 'failed'));
+        $commands->write(new WorkflowId('law', 'failed'), $this->sealed('failed-message'), 'await', 0, 1);
+        $this->assertTrue($commands->markPublished('failed-message'));
+        $this->assertTrue($commands->markFailed('failed', 'failed-message', 'refused'));
+        $this->assertSame([['failed', 'failed-message']], $this->contractInstances()->strandedByFailedEffect());
+    }
+
+    #[Test]
     public function a_re_frozen_type_keeps_the_first_reason_and_the_first_instant(): void
     {
         // the payload half of the shared lift law, judged here because the port hands back only a

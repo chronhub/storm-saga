@@ -168,7 +168,7 @@ final readonly class StepPolicy
         return new AdvanceInstance(Stimulus::event($event));
     }
 
-    private function onStateTimeout(Signal $signal, WorkflowInstanceRow $row, WorkflowDefinition $def, PointInTime $now): Skip|EscalateWait|EnforceGlobalDeadline|AdvanceInstance|HaltAtGlobalCap
+    private function onStateTimeout(Signal $signal, WorkflowInstanceRow $row, WorkflowDefinition $def, PointInTime $now): Skip|EscalateWait|EnforceGlobalDeadline|AdvanceInstance|HaltAtGlobalCap|WaiveGlobalCap
     {
         if ($signal->expectedStateKey !== null && $row->stateKey !== $signal->expectedStateKey) {
             return new Skip(SkipReason::StaleState); // the timer lost its race against a transition
@@ -181,6 +181,12 @@ final readonly class StepPolicy
                 // bound it: the spent cap bounds it here via HaltAtGlobalCap, never an escalate-forever.
                 return $this->retriableWait($def, $row->stateKey)
                     ? new Skip(SkipReason::CapWaived)
+                    : new HaltAtGlobalCap;
+            }
+
+            if ($row->globalDeadlineConsumedAt !== null) {
+                return $this->retriableWait($def, $row->stateKey)
+                    ? new WaiveGlobalCap
                     : new HaltAtGlobalCap;
             }
 
@@ -232,6 +238,9 @@ final readonly class StepPolicy
     {
         if ($def->globalTimeout === null) {
             return new Skip(SkipReason::NoGlobalDeadline); // a phantom timer; the definition changed
+        }
+        if ($row->globalDeadlineConsumedAt !== null) {
+            return new Skip(SkipReason::GlobalDeadlineConsumed);
         }
         if ($row->waivedAt !== null) {
             // a straggler Global timer, claimed before the waive committed: the cap is already spent;
@@ -332,6 +341,7 @@ final readonly class StepPolicy
     private function pastGlobalDeadline(WorkflowDefinition $def, WorkflowInstanceRow $row, PointInTime $now): bool
     {
         return $def->globalTimeout !== null
+            && $row->globalDeadlineConsumedAt === null
             && $row->startedAt !== null
             && $row->startedAt->addSeconds(max(1, $def->globalTimeout))->isBefore($now);
     }

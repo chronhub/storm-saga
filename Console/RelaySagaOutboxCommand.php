@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Storm\Saga\Console;
 
 use Override;
+use Storm\Saga\Outbox\SagaOutboxDrainIncomplete;
 use Storm\Saga\Outbox\SagaOutboxRelay;
 use Storm\Support\Console\DaemonLoop;
 use Storm\Support\Console\PositiveIntOption;
@@ -59,8 +60,8 @@ final class RelaySagaOutboxCommand extends Command
     /**
      * {@inheritDoc}
      *
-     * @throws Throwable on a DBAL failure draining the outbox, or from the post-commit saga settle of a
-     *                   dead-lettered command, surfaced to the console runner
+     * @throws Throwable from the daemon alone, on a DBAL failure draining the outbox or from the
+     *                   post-commit saga settle of a dead-lettered command; the one-shot reports it
      */
     #[Override]
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -78,7 +79,27 @@ final class RelaySagaOutboxCommand extends Command
             return $this->daemon($io, $input, $batch);
         }
 
-        $result = $this->relay->drain($batch);
+        try {
+            $result = $this->relay->drain($batch);
+        } catch (SagaOutboxDrainIncomplete $e) {
+            // A transient dispatch failure: the relay fails FORWARD; what it reports here is
+            // committed, namely dispatched rows, dead-letters, the bumped back-off; the rest stays
+            // pending. Show the durable progress, then signal the scheduler to retry, the same shape
+            // and the same phrase as the event relay, so one alert rule reads both lanes.
+            $io->error(sprintf(
+                'Relayed %d saga command(s), %d dead-lettered, then stopped on a publish error: %s',
+                $e->progress->published,
+                $e->progress->failed,
+                $e->getPrevious()?->getMessage() ?? $e->getMessage(),
+            ));
+
+            return Command::FAILURE;
+        } catch (Throwable $e) {
+            // the drain's own statements failed, nothing committed to report: the event relay's shape
+            $io->error(sprintf('Saga outbox relay failed: %s', $e->getMessage()));
+
+            return Command::FAILURE;
+        }
 
         if ($result->failed > 0) {
             $io->warning(sprintf(
@@ -138,6 +159,11 @@ final class RelaySagaOutboxCommand extends Command
     /**
      * Daemon mode: boot once, loop the drain in-process until SIGTERM/SIGINT or `--time-limit`. Each pass is an
      * independent {@see \Storm\Saga\Outbox\SagaOutboxRelay::drain()} with its own transaction, so looping is just repeated drains.
+     *
+     * A {@see SagaOutboxDrainIncomplete}, a transient dispatch failure, is NOT fatal here: its progress
+     * is committed and the relay's back-off is bumped, so the loop counts it as idle and polls before
+     * retrying the tail. Any other Throwable propagates, so the process exits non-zero and the
+     * supervisor respawns with back-off.
      */
     private function daemon(SymfonyStyle $io, InputInterface $input, int $batch): int
     {
@@ -145,11 +171,20 @@ final class RelaySagaOutboxCommand extends Command
         $failed = 0;
 
         $this->daemonLoop(function () use ($batch, &$published, &$failed): int {
-            $result = $this->relay->drain($batch);
+            try {
+                $result = $this->relay->drain($batch);
+                $work = $result->published + $result->failed;
+            } catch (SagaOutboxDrainIncomplete $e) {
+                // The progress is committed and the back-off bumped; treat the tick as idle so the
+                // poll honors it rather than spinning on an outage no loop can clear.
+                $result = $e->progress;
+                $work = 0;
+            }
+
             $published += $result->published;
             $failed += $result->failed;
 
-            return $result->published + $result->failed;
+            return $work;
         }, $this->daemonSleepMs($input), $this->daemonTimeLimit($input));
 
         $io->success(sprintf(

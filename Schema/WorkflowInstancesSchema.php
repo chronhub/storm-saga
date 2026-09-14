@@ -99,6 +99,7 @@ final class WorkflowInstancesSchema
                     started_at     timestamptz(6) NOT NULL DEFAULT clock_timestamp(),
                     updated_at     timestamptz(6) NOT NULL DEFAULT clock_timestamp(),
                     waived_at      timestamptz(6) NULL,
+                    global_deadline_consumed_at timestamptz(6) NULL,
                     paused_at      timestamptz(6) NULL,
                     paused_reason  text NULL,
                     parent_workflow_type  text GENERATED ALWAYS AS (context -> '$parent' ->> 'type') STORED,

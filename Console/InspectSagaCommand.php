@@ -125,7 +125,7 @@ final class InspectSagaCommand extends Command
         // of this correlation is it, how much retry budget did it burn, and, the one an operator
         // reaches for first, how long has it been sitting there.
         $io->writeln(sprintf(
-            ' definition=v%d   generation=%d   retries_total=%d%s   updated=%s%s',
+            ' definition=v%d   generation=%d   retries_total=%d%s   updated=%s%s%s',
             $saga->definitionVersion,
             $saga->generation,
             $saga->retryTotal,
@@ -134,6 +134,7 @@ final class InspectSagaCommand extends Command
             $saga->retimes > 0 ? sprintf('   retimes=%d', $saga->retimes) : '',
             $saga->updatedAt ?? '—',
             $saga->waivedAt !== null ? sprintf('   <comment>waived=%s</comment>', $saga->waivedAt) : '',
+            $saga->globalDeadlineConsumedAt !== null ? sprintf('   <comment>cap-consumed=%s</comment>', $saga->globalDeadlineConsumedAt) : '',
         ));
 
         // A freeze holds the status at `running`, so the line above cannot show it and an operator

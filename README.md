@@ -38,7 +38,10 @@ workflow this parent consents to engender, with the wait that consumes its concl
   or roll back together (`Engine/StepExecutor`). The machine and performers return data, never write.
 - **One saga per correlation.** A `correlationId` identifies exactly one instance. `start` is
   idempotent — a second start for the same id is a no-op. Events route to the instance by correlation
-  (`routeOutcome` / `deliverByCorrelation`).
+  (`routeOutcome` / `deliverByCorrelation`). The correlation must therefore SURVIVE the transport an
+  awaited event rides: an event transport on the neutral wire keeps it only when the transport
+  declares `trusted_identity: true`. A key that matches no instance leaves a `storm.saga.outcome_*`
+  debug line rather than nothing at all.
 - **Fenced + version-pinned.** Each step runs under a Postgres advisory fence
   (`Locking/PgAdvisoryFence`) plus an OCC version guard; an in-flight instance always runs the
   definition shape it was born under, even after a newer version is deployed.
@@ -78,6 +81,8 @@ Console (`Console/`), spelled in full because a reader copies them:
   rolls back untouched.
 - `storm:saga:relay` — drain the command outbox.
 - `storm:saga:timers` — drive what is due.
+- `storm:saga:timers:audit` — name the live timers armed further out than the tempo their
+  workflow declares, the trace of a clock that jumped; `--rearm` brings them to now.
 - `storm:saga:cleanup` — reconcile stranded sagas, then prune terminal bookkeeping.
 - `storm:saga:list` — the filtered listing, the way in when you have an incident and no correlation
   id: by type, status, idle time or waived budget, oldest-touched first.
@@ -94,6 +99,9 @@ Console (`Console/`), spelled in full because a reader copies them:
 - `storm:saga:redrive` — re-send a dead-lettered command instead of cancelling the saga around it;
   refuses unless the effect is proven uncommitted, `--force --reason` owns the risk.
 - `storm:saga:versions` — pinning counts per version, plus a deploy `--check`.
+- `storm:saga:validate`: assemble every declared workflow definition and report all failures, not
+  just the first. The registry assembles a graph at its first use, so this is the gate that puts the
+  whole verdict back before a deployment; run it in the CI of the application that declares them.
 - `storm:saga:state:migrate` — drive every behind instance of one type through its declared state
   migration chain; the sweep that makes the lazy migration bounded and observable.
 

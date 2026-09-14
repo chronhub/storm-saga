@@ -71,7 +71,7 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
         try {
             $cursor = $this->addBusinessDays($cursor, $businessDays);
             $cursor = $this->addBusinessSeconds($cursor, $businessHours * 3600);
-            // unreachable by construction: all modify() args are hardcoded '+1 day' or int-derived "+$seconds seconds"
+            // Date modifications use a fixed day step or a numeric count of microseconds.
             // @codeCoverageIgnoreStart
         } catch (DateMalformedStringException $e) {
             throw new InvalidDateTimeException('Failed to advance business time: '.$e->getMessage(), 0, $e);
@@ -139,17 +139,19 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
         }
 
         $cursor = $this->rollToBusinessWindow($cursor);
+        $remaining = $seconds * 1_000_000;
 
         while (true) {
             $close = $cursor->setTime($this->closeHour, 0);
-            $secondsToClose = $close->getTimestamp() - $cursor->getTimestamp();
+            $remainingToClose = ($close->getTimestamp() - $cursor->getTimestamp()) * 1_000_000
+                - (int) $cursor->format('u');
 
-            if ($seconds <= $secondsToClose) {
-                return $cursor->modify("+$seconds seconds");
+            if ($remaining <= $remainingToClose) {
+                return $cursor->setTimezone(new DateTimeZone('UTC'))->modify("+$remaining microseconds");
             }
 
-            $seconds -= $secondsToClose;
-            $cursor = $this->nextOpen($close);
+            $remaining -= $remainingToClose;
+            $cursor = $this->nextOpen($cursor);
         }
     }
 
@@ -166,7 +168,7 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
             $hour = (int) $cursor->format('G');
 
             // the two `<` below carry `<=` mutants proven equivalent: at hour==openHour, setTime(open) is a no-op;
-            // at hour==closeHour, addBusinessSeconds's loop absorbs a cursor-at-close, where secondsToClose=0 advances to nextOpen.
+            // At the close, the loop advances to `nextOpen()` when no window remains.
             // Left UN-ignored on purpose: their `>` siblings ARE killed by tests, and an ignore would mask those too.
             if ($hour < $this->openHour) {
                 return $cursor->setTime($this->openHour, 0);

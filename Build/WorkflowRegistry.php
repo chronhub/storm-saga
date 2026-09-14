@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Storm\Saga\Build;
 
 use Psr\Container\ContainerExceptionInterface;
+use Psr\Container\ContainerInterface;
 use Psr\Container\NotFoundExceptionInterface;
 use ReflectionException;
 use Storm\Saga\Exception\InvalidWorkflowDefinition;
@@ -13,20 +14,47 @@ use Storm\Saga\Exception\WorkflowVersionNotFound;
 use Storm\Saga\Workflow\WorkflowDefinition;
 
 /**
- * Lookup of the built workflow definitions by `(name, version)`. The definitions are discovered at boot:
- * the `#[Workflow]` classes are tagged at compile time, then each is built by `WorkflowBuilder`, with no
- * runtime filesystem scan and no cache file.
+ * Lookup of the workflow definitions by `(name, version)`, over a declaration index that is always
+ * complete and a set of assembled graphs that need not be.
  *
- * Versioning and pinning: a name can carry several versions at once, an evolved definition co-registered
- * as a higher version alongside the one its in-flight instances are pinned to. A new instance is born
- * under `latestVersion()`; an existing instance resolves its pinned version via `get()` with an explicit
- * version. The `(name, version)` pair is unique, and a version `label` when set is unique per name; both
- * are enforced at construction.
+ * Two regimes feed it, and they answer identically:
+ *
+ * - Assembled, `new WorkflowRegistry($definitions)`: every graph is already built, and the index is
+ *   derived from them. What a test constructs by hand, and the shape `fromWorkflows()` produces.
+ *
+ * - Lazy, `lazy()`: the index arrives from a compiled declaration table and a graph is assembled at
+ *   its first `get()`, then memoized. A process pays for the workflows it touches, not for the
+ *   catalogue, which is what a shared-nothing request needs; a resident worker assembles each graph
+ *   once and never again.
+ *
+ * The index is what keeps the two honest. The laws that compare declarations to each other, a unique
+ * `(name, version)`, a unique label per name, one `stateVersion` and one `#[ExposesState]` allowlist
+ * per name, hold over metadata alone, so they fall at construction under both regimes rather than
+ * waiting for something to force every graph. `has()` and `latestVersion()` answer from the index and
+ * assemble nothing.
+ *
+ * What lazy assembly defers is the per-graph verdict: a malformed declaration is refused when its own
+ * definition is first assembled. `storm:saga:validate` is the gate that forces all of them before a
+ * deployment, and it is the consuming application's pipeline that must run it.
+ *
+ * Versioning and pinning: a name can carry several versions at once, an evolved definition
+ * co-registered as a higher version alongside the one its in-flight instances are pinned to. A new
+ * instance is born under `latestVersion()`; an existing instance resolves its pinned version via
+ * `get()` with an explicit version.
+ *
+ * @see WorkflowIndex
+ * @see LazyWorkflowSource
+ * @see \Storm\Saga\Console\ValidateSagaCommand
  */
 final class WorkflowRegistry
 {
-    /** @var array<string, non-empty-array<int, WorkflowDefinition>> keyed by name, then by version */
+    /** @var array<string, array<int, WorkflowDefinition>> memoized graphs, keyed by name then version */
     private array $definitions = [];
+
+    private WorkflowIndex $index;
+
+    /** Null under the assembled regime, where every declared pair is memoized at construction. */
+    private ?LazyWorkflowSource $source = null;
 
     /**
      * @param  iterable<WorkflowDefinition>  $definitions
@@ -38,54 +66,24 @@ final class WorkflowRegistry
      */
     public function __construct(iterable $definitions = [])
     {
-        /** @var array<string, array<string, true>> $labels keyed by name, then by seen label */
-        $labels = [];
-        /** @var array<string, int> $stateVersions the per-name data contract, first-seen wins the comparison */
-        $stateVersions = [];
-        /** @var array<string, list<string>> $exposures the per-name exposure allowlist, same law */
-        $exposures = [];
+        $assembled = [];
+        $declared = [];
 
         foreach ($definitions as $definition) {
-            $name = $definition->name;
-            $version = $definition->version;
+            $assembled[] = $definition;
+            $declared[] = WorkflowMetadata::fromDefinition($definition);
+        }
 
-            if ($version < 1) {
-                throw InvalidWorkflowDefinition::versionBelowOne($name, $version);
-            }
-            if ($definition->stateVersion < 1) {
-                throw InvalidWorkflowDefinition::stateVersionBelowOne($name, $definition->stateVersion);
-            }
-            if (isset($this->definitions[$name][$version])) {
-                throw InvalidWorkflowDefinition::duplicateVersion($name, $version);
-            }
-            if ($definition->label !== null && isset($labels[$name][$definition->label])) {
-                throw InvalidWorkflowDefinition::duplicateLabel($name, $definition->label);
-            }
-            // the data contract is per NAME: co-registered versions share their activities, so a
-            // disagreement is a declaration bug, the same agreement law as the class-level #[Prioritized]
-            if (isset($stateVersions[$name]) && $stateVersions[$name] !== $definition->stateVersion) {
-                throw InvalidWorkflowDefinition::stateVersionDisagreement($name, $stateVersions[$name], $version, $definition->stateVersion);
-            }
-            $stateVersions[$name] = $definition->stateVersion;
-            // same law for the exposure allowlist: a SECURITY declaration cannot depend on which
-            // co-registered version happens to serve the read
-            if (isset($exposures[$name]) && $exposures[$name] !== $definition->exposedStateKeys) {
-                throw InvalidWorkflowDefinition::exposedStateDisagreement($name, $version);
-            }
-            $exposures[$name] = $definition->exposedStateKeys;
+        // the index judges the whole table first, so a refused declaration leaves nothing half-registered
+        $this->index = new WorkflowIndex($declared);
 
-            $this->definitions[$name][$version] = $definition;
-            if ($definition->label !== null) {
-                // @infection-ignore-all; equivalent: the dup-detection above reads this only via isset(), which
-                // is value-agnostic, since true vs. false both register the key as "seen"; only the key's presence matters
-                $labels[$name][$definition->label] = true;
-            }
+        foreach ($assembled as $definition) {
+            $this->definitions[$definition->name][$definition->version] = $definition;
         }
     }
 
     /**
-     * Build the registry from the discovered `#[Workflow]` instances, each reflected into a definition by
-     * the `WorkflowBuilder`. The DI factory: the bundle hands the tagged workflow services.
+     * Build the registry by assembling every discovered `#[Workflow]` instance at once.
      *
      * @param  iterable<object>  $workflows
      *
@@ -106,74 +104,133 @@ final class WorkflowRegistry
     }
 
     /**
-     * Is a workflow registered? With `$version` null, asks whether the name exists at all; with a
-     * version, whether that specific version is registered.
+     * Build the registry over a compiled declaration index, assembling nothing.
+     *
+     * The DI factory of the lazy regime: the compiler pass hands the index it read off the
+     * `#[Workflow]` classes and a locator keyed by `WorkflowMetadata::keyFor()`.
+     *
+     * @param  ContainerInterface  $workflows  the `(name, version)`-keyed workflow-instance locator
+     *
+     * @throws InvalidWorkflowDefinition when the index itself is contradictory
      */
-    public function has(string $name, ?int $version = null): bool
+    public static function lazy(WorkflowIndex $index, ContainerInterface $workflows, WorkflowBuilder $builder): self
     {
-        if ($version === null) {
-            return isset($this->definitions[$name]);
-        }
+        $registry = new self;
+        $registry->index = $index;
+        $registry->source = new LazyWorkflowSource($workflows, $builder);
 
-        return isset($this->definitions[$name][$version]);
+        return $registry;
     }
 
     /**
-     * Resolve a definition. With `$version` null, resolves the latest version, a new instance's birth
-     * definition; with a version, resolves that pinned version for an existing instance.
+     * Is a workflow registered? With `$version` null, asks whether the name exists at all; with a
+     * version, whether that specific version is registered. Assembles nothing.
+     */
+    public function has(string $name, ?int $version = null): bool
+    {
+        return $this->index->has($name, $version);
+    }
+
+    /**
+     * Resolve a definition, assembling it on first use under the lazy regime. With `$version` null,
+     * resolves the latest version, a new instance's birth definition; with a version, resolves that
+     * pinned version for an existing instance.
      *
      * @throws WorkflowNotFound when no version of `$name` is registered
      * @throws WorkflowVersionNotFound when `$name` exists but not at `$version`, such as purged while an
      *                                 instance was still pinned to it
+     * @throws InvalidWorkflowDefinition when the declaration assembled here is malformed
+     * @throws ReflectionException
+     * @throws ContainerExceptionInterface
+     * @throws NotFoundExceptionInterface
      */
     public function get(string $name, ?int $version = null): WorkflowDefinition
     {
-        if ($version === null) {
-            return $this->definitions[$name][$this->latestVersion($name)];
+        $version ??= $this->latestVersion($name);
+
+        $memoized = $this->definitions[$name][$version] ?? null;
+        if ($memoized !== null) {
+            return $memoized;
         }
 
-        return $this->definitions[$name][$version] ?? throw WorkflowVersionNotFound::for($name, $version);
+        // one refusal for two regimes: assembled, an unmemoized pair was never registered; lazy, the
+        // index is the register, and a pair it does not hold has no service to assemble
+        if ($this->source === null || ! $this->index->has($name, $version)) {
+            throw WorkflowVersionNotFound::for($name, $version);
+        }
+
+        return $this->definitions[$name][$version] = $this->source->assemble($name, $version);
     }
 
     /**
-     * The highest registered version of `$name`, the version a new instance pins at birth.
+     * The highest registered version of `$name`, the version a new instance pins at birth. Assembles
+     * nothing.
      *
      * @throws WorkflowNotFound when no version of `$name` is registered
      */
     public function latestVersion(string $name): int
     {
-        $byVersion = $this->definitions[$name] ?? throw WorkflowNotFound::named($name);
-
-        return max(array_keys($byVersion));
+        return $this->index->latestVersion($name);
     }
 
     /**
-     * Every registered version of `$name`, keyed by a version.
+     * Every registered version of `$name`, keyed by a version; assembles the ones not yet memoized.
      *
      * @return array<int, WorkflowDefinition>
      *
      * @throws WorkflowNotFound when no version of `$name` is registered
+     * @throws WorkflowVersionNotFound when a declared version has no service to assemble
+     * @throws InvalidWorkflowDefinition when a declaration assembled here is malformed
+     * @throws ReflectionException
+     * @throws ContainerExceptionInterface
+     * @throws NotFoundExceptionInterface
      */
     public function versions(string $name): array
     {
-        return $this->definitions[$name] ?? throw WorkflowNotFound::named($name);
+        $resolved = [];
+
+        foreach ($this->index->versionsOf($name) as $version) {
+            $resolved[$version] = $this->get($name, $version);
+        }
+
+        return $resolved;
     }
 
     /**
-     * Every registered definition, flattened across all names and versions.
+     * Every registered definition, flattened across all names and versions; assembles the ones not yet
+     * memoized, and therefore stops at the FIRST malformed declaration. The exhaustive report a
+     * deployment gate needs is `storm:saga:validate`, which resolves pair by pair and collects.
      *
      * @return list<WorkflowDefinition>
+     *
+     * @throws WorkflowNotFound when a declared name has no registered version
+     * @throws WorkflowVersionNotFound when a declared version has no service to assemble
+     * @throws InvalidWorkflowDefinition when a declaration assembled here is malformed
+     * @throws ReflectionException
+     * @throws ContainerExceptionInterface
+     * @throws NotFoundExceptionInterface
      */
     public function all(): array
     {
         $all = [];
 
-        foreach ($this->definitions as $byVersion) {
-            foreach ($byVersion as $definition) {
-                $all[] = $definition;
+        foreach ($this->index->declared() as $name => $versions) {
+            foreach ($versions as $version) {
+                $all[] = $this->get($name, $version);
             }
         }
 
         return $all;
+    }
+
+    /**
+     * The registered `(name, version)` pairs, every name with its version numbers, assembling nothing.
+     * What a caller iterates to resolve one pair at a time and survive a failure.
+     *
+     * @return array<string, non-empty-list<int>>
+     */
+    public function declared(): array
+    {
+        return $this->index->declared();
     }
 }

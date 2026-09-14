@@ -436,9 +436,9 @@ final readonly class TimeRules
 
     /**
      * A `retriable` wait must be a heartbeat wait, a timeout with no finalized edge: retriable tells the
-     * engine to re-arm past the global cap instead of halting, which is only meaningful for a gating
-     * heartbeat whose success is inevitable post-pivot. On a deadline wait, or a wait without
-     * heartbeatSeconds, it would silently do nothing. Gating is then transitive, since
+     * engine to disarm at the spent global cap and hand off to reconciliation instead of halting. This
+     * is only meaningful for a gating heartbeat whose success is inevitable post-pivot. On a deadline
+     * wait, or a wait without heartbeatSeconds, it would silently do nothing. Gating is then transitive, since
      * `heartbeatWaitsMustGate()` already rejects a heartbeat on a non-gating wait.
      *
      * @param  array<string, State>  $states

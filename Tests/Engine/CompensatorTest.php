@@ -58,6 +58,25 @@ use Storm\Saga\Workflow\WorkflowDefinition;
 final class CompensatorTest extends TestCase
 {
     #[Test]
+    public function a_dispositioned_record_is_not_available_for_another_compensation(): void
+    {
+        $record = CompensationRecord::pending('charge')->confirm()->settle(CompensationStatus::Skipped, 'already disposed');
+        $row = $this->row(WorkflowStatus::Halted, [$record]);
+        $this->assertFalse($this->compensator()->hasConfirmedCompensation($this->def(), $row));
+        $row = $this->row(WorkflowStatus::Halted, [$record, CompensationRecord::pending('ship')->confirm()]);
+        $this->assertTrue($this->compensator()->hasConfirmedCompensation($this->def(), $row));
+    }
+
+    #[Test]
+    public function a_confirmation_preserves_a_record_without_an_activity_state(): void
+    {
+        $def = $this->def();
+        $record = CompensationRecord::pending('await_x');
+        $log = $this->compensator()->advanceLog($def, $def->state('await_x'), new Transition('next', OnTrigger::Event), stdClass::class, [$record], new PointInTime);
+        $this->assertSame([$record], $log);
+    }
+
+    #[Test]
     public function maybe_compensate_is_a_pass_through_when_the_result_is_not_halted(): void
     {
         $running = new Rested($this->row(WorkflowStatus::Running, []));

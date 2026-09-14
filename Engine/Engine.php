@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Storm\Saga\Engine;
 
+use Psr\Log\LoggerInterface;
 use Storm\Clock\PointInTime;
 use Storm\Saga\Build\WorkflowRegistry;
 use Storm\Saga\Child\ChildCorrelation;
@@ -33,6 +34,14 @@ final readonly class Engine implements SagaEngine
         private StepExecutor $executor,
         private WorkflowInstances $instances,
         private FailedWorkflowCommands $outbox,
+        /**
+         * Where a routed outcome that found no instance leaves its line, `storm.saga.outcome_unrouted`
+         * at debug with the correlation and the event class, never the payload. Debug because an event
+         * bus carries far more events than any saga awaits; the line is what keeps a correlation LOST on
+         * the way, the wire dropping it and a fresh one taking its place, from costing a saga its advance
+         * with nothing to read anywhere. Null logs nothing, for standalone use.
+         */
+        private ?LoggerInterface $logger = null,
     ) {}
 
     public function start(string $workflowType, string $correlationId, array $vars = [], array $context = [], ?string $causationId = null): bool
@@ -184,7 +193,14 @@ final readonly class Engine implements SagaEngine
     {
         $row = $this->instances->findByCorrelation($correlationId);
         if ($row === null) {
-            return false; // no saga with this correlation; common, not an error
+            // no saga with this correlation; common, not an error, and the one trace of a routing key
+            // that arrived wrong. Debug: an event bus carries plenty of events no saga waits for
+            $this->logger?->debug('storm.saga.outcome_unrouted', [
+                'correlation_id' => $correlationId,
+                'event' => $event::class,
+            ]);
+
+            return false;
         }
 
         $report = $this->executor->execute(
