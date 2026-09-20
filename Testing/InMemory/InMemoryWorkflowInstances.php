@@ -52,6 +52,13 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
         return $this->state->instances[$this->state->instanceKey($id)]['row'] ?? null;
     }
 
+    public function idByCorrelation(string $correlationId): ?WorkflowId
+    {
+        $row = $this->findByCorrelation($correlationId);
+
+        return $row === null ? null : new WorkflowId($row->workflowType, $row->correlationId);
+    }
+
     public function findByCorrelation(string $correlationId): ?WorkflowInstanceRow
     {
         foreach ($this->state->instances as $entry) {

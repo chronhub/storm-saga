@@ -8,8 +8,7 @@ use Storm\Saga\Attributes\TransactionalHandler;
 
 /**
  * What is actually KNOWN about a dead-lettered command's effect, the settle's second input beside the
- * pairing. A dead-letter is not by itself proof that the handler transaction rolled back: of the four
- * paths that dead-letter a saga-issued command, two prove the effect never committed and two cannot.
+ * pairing. A dead-letter is not by itself proof that the handler transaction rolled back.
  *
  * `Uncommitted`: no effect can have been committed, either because the command never reached a handler
  * at all, the relay failing to decode it or dispatch finding no handler, both proven by the engine and
@@ -17,8 +16,9 @@ use Storm\Saga\Attributes\TransactionalHandler;
  * it commits or rolls back as one. Compensating around it is safe.
  *
  * `Unknown`: nobody proved anything. The retry budget ran out on a publish that, under a sync
- * transport, IS the handler; or the consumer's own retries were exhausted after it had run. The
- * effect may well have landed, so the engine escalates instead of compensating: the saga stays alive
+ * transport, IS the handler; the consumer's own retries were exhausted after it had run; or execution
+ * was explicitly refused permanently without proving the absence of effects. The effect may well
+ * have landed, so the engine escalates instead of compensating: the saga stays alive
  * and visible, where the cleanup sweep and liveness find it, rather than being rolled back around an
  * effect that is out there.
  *

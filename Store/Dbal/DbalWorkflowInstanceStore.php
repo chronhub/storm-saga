@@ -84,6 +84,18 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         });
     }
 
+    public function idByCorrelation(string $correlationId): ?WorkflowId
+    {
+        return $this->guard(function () use ($correlationId): ?WorkflowId {
+            $row = $this->connection->fetchAssociative(
+                'SELECT workflow_type, correlation_id FROM workflow_instances WHERE correlation_id = :corr LIMIT 1',
+                ['corr' => $correlationId],
+            );
+
+            return $row === false ? null : new WorkflowId((string) $row['workflow_type'], (string) $row['correlation_id']);
+        });
+    }
+
     public function create(WorkflowInstanceRow $row, CorrelationReuse $reuse = CorrelationReuse::Reject): int
     {
         try {
@@ -106,7 +118,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
                 'INSERT INTO workflow_instances (workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at)
                  VALUES (:type, :corr, :state, :status, CAST(:vars AS jsonb), CAST(:retries AS jsonb), CAST(:compensations AS jsonb), CAST(:context AS jsonb), :version, :generation, :def_version, :state_version, :retry_total, :retimes, CAST(:arms AS jsonb), CAST(:families AS jsonb), CAST(:parked AS jsonb),
                          COALESCE(CAST(:started_at AS timestamptz), clock_timestamp()), CAST(:global_deadline_consumed_at AS timestamptz), CAST(:waived_at AS timestamptz))',
-                [...$this->columns($row), 'started_at' => $row->startedAt?->toString(), 'def_version' => $row->definitionVersion, 'generation' => $generation],
+                [...self::columns($row), 'started_at' => $row->startedAt?->toString(), 'def_version' => $row->definitionVersion, 'generation' => $generation],
                 ['version' => ParameterType::INTEGER, 'def_version' => ParameterType::INTEGER, 'state_version' => ParameterType::INTEGER, 'retry_total' => ParameterType::INTEGER, 'generation' => ParameterType::INTEGER],
             );
             // the durable claim, second on purpose: a LIVING duplicate must be reported as owned, and it
@@ -155,19 +167,39 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     public function update(WorkflowInstanceRow $row): void
     {
         $affected = $this->guard(fn (): int|string => $this->connection->executeStatement(
-            /** @lang PostgreSQL */
-            'UPDATE workflow_instances
-             SET state_key = :state, status = :status, vars = CAST(:vars AS jsonb),
-                 retries = CAST(:retries AS jsonb), compensations = CAST(:compensations AS jsonb), context = CAST(:context AS jsonb),
-                 retry_total = :retry_total, retimes = :retimes, arms = CAST(:arms AS jsonb), families = CAST(:families AS jsonb), parked = CAST(:parked AS jsonb), global_deadline_consumed_at = CAST(:global_deadline_consumed_at AS timestamptz), waived_at = CAST(:waived_at AS timestamptz), state_version = :state_version, version = version + 1, updated_at = clock_timestamp()
-             WHERE workflow_type = :type AND correlation_id = :corr AND version = :version',
-            $this->columns($row),
-            ['version' => ParameterType::INTEGER, 'retry_total' => ParameterType::INTEGER, 'state_version' => ParameterType::INTEGER],
+            self::UPDATE_SQL,
+            self::updateParameters($row),
+            self::UPDATE_TYPES,
         ));
 
         if ($affected === 0) {
             throw StaleWorkflowInstance::forStep($row->workflowType, $row->correlationId, $row->version);
         }
+    }
+
+    /**
+     * The OCC update, the single statement `update()` runs, exposed so a step writer can embed it as
+     * the branch every other write of the step depends on. Named parameters match `updateParameters()`.
+     */
+    public const string UPDATE_SQL = <<<'SQL'
+        UPDATE workflow_instances
+        SET state_key = :state, status = :status, vars = CAST(:vars AS jsonb),
+            retries = CAST(:retries AS jsonb), compensations = CAST(:compensations AS jsonb), context = CAST(:context AS jsonb),
+            retry_total = :retry_total, retimes = :retimes, arms = CAST(:arms AS jsonb), families = CAST(:families AS jsonb), parked = CAST(:parked AS jsonb), global_deadline_consumed_at = CAST(:global_deadline_consumed_at AS timestamptz), waived_at = CAST(:waived_at AS timestamptz), state_version = :state_version, version = version + 1, updated_at = clock_timestamp()
+        WHERE workflow_type = :type AND correlation_id = :corr AND version = :version
+        SQL;
+
+    /** The parameter types `UPDATE_SQL` binds beyond strings. */
+    public const array UPDATE_TYPES = ['version' => ParameterType::INTEGER, 'retry_total' => ParameterType::INTEGER, 'state_version' => ParameterType::INTEGER];
+
+    /**
+     * The bound values of `UPDATE_SQL` for this row, the four bags encoded and measured.
+     *
+     * @return array<string, mixed>
+     */
+    public static function updateParameters(WorkflowInstanceRow $row): array
+    {
+        return self::columns($row);
     }
 
     public function delete(WorkflowId $id): void
@@ -597,7 +629,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
      *
      * @throws JsonException when a state bag cannot be encoded
      */
-    private function columns(WorkflowInstanceRow $row): array
+    private static function columns(WorkflowInstanceRow $row): array
     {
         $columns = [
             'type' => $row->workflowType,

@@ -7,6 +7,8 @@ namespace Storm\Saga\Outbox;
 use Throwable;
 
 /**
+ * Declares that no handler executed. A refusal after execution uses `RejectedCommandExecution`.
+ *
  * Marker for a command-dispatch failure that retrying can never fix: no handler is wired for the
  * command, or the payload is one the validation middleware will always reject. The opposite of a
  * transient outage such as a broker down or a deadlock.

@@ -181,17 +181,18 @@ final readonly class Engine implements SagaEngine
 
     public function deliverByCorrelation(string $correlationId, object $event, ?string $causationId = null): bool
     {
-        $row = $this->instances->findByCorrelation($correlationId);
-        if ($row === null) {
+        $id = $this->instances->idByCorrelation($correlationId);
+        if ($id === null) {
             return false; // no saga with this correlation; common when the event has a correlationId but isn't saga-bound
         }
 
-        return $this->deliver($row->workflowType, $row->correlationId, $event, $causationId);
+        return $this->deliver($id->workflowType, $id->correlationId, $event, $causationId);
     }
 
     public function routeOutcome(string $correlationId, object $event, ?string $causationId = null): bool
     {
-        $row = $this->instances->findByCorrelation($correlationId);
+        // the type alone: the step reloads the row under its fence, so a wide read here is paid twice
+        $row = $this->instances->idByCorrelation($correlationId);
         if ($row === null) {
             // no saga with this correlation; common, not an error, and the one trace of a routing key
             // that arrived wrong. Debug: an event bus carries plenty of events no saga waits for

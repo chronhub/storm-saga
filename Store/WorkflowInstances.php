@@ -40,6 +40,13 @@ interface WorkflowInstances
     public function findByCorrelation(string $correlationId): ?WorkflowInstanceRow;
 
     /**
+     * The id of the unique instance with this `correlationId`, the narrow read for a caller that
+     * needs the workflow type alone before a step reloads the row under its fence. Returns null when
+     * none matches.
+     */
+    public function idByCorrelation(string $correlationId): ?WorkflowId;
+
+    /**
      * Insert a fresh instance on the first step, and claim its correlation durably under `$reuse`, the
      * workflow's declared policy. Its `version` starts at the row's value of 0.
      *

@@ -61,7 +61,9 @@ use Throwable;
  * - Permanent: dead-lettered now, when the row can't be decoded due to a corrupt payload or unknown
  *   type, or when `publish()` threw an `UnrecoverableCommandDispatch` for no handler or an invalid
  *   command; retrying can't help, and a prompt dead-letter lets the post-commit `failIssuedEffect`
- *   compensation run sooner.
+ *   compensation run sooner. An explicit `RejectedCommandExecution` also stops retries immediately,
+ *   even when its cause is infrastructure-related, but retains unknown effect evidence because a
+ *   handler may have run. It cannot authorize compensation on its own.
  *
  * Each row's outcome is written under its own savepoint. `publish()` shares this connection, so a
  * transport failure that is itself a failed statement, not merely a thrown PHP exception, leaves
@@ -175,14 +177,11 @@ final readonly class SagaOutboxRelay
 
                     try {
                         $this->publisher->publish($message, (string) $row['bus'], (string) $row['workflow_type']);
-                    } catch (UnrecoverableCommandDispatch $e) {
-                        // Permanent: no handler / invalid command; retrying can't help. Dead-letter now
-                        // instead of burning the budget, which would also delay the failIssuedEffect settle.
-                        // dispatch refused it outright: no handler ran, so no effect can exist. Rolled back
-                        // FIRST: publish() shares this connection, so its own failed statement may have
-                        // left the transaction aborted, and writing the dead-letter on top would fail too.
+                    } catch (UnrecoverableCommandDispatch|RejectedCommandExecution $e) {
+                        // Roll back before recording the refusal because dispatch can leave this transaction
+                        // aborted. A permanent execution refusal says nothing about effects outside it.
                         $connection->rollbackSavepoint($savepoint);
-                        $this->deadLetter($connection, $id, $attempts + 1, $e, EffectEvidence::Uncommitted);
+                        $this->deadLetter($connection, $id, $attempts + 1, $e, $e instanceof RejectedCommandExecution ? EffectEvidence::Unknown : EffectEvidence::Uncommitted);
                         $deadLettered[] = [(string) $row['correlation_id'], $this->sealedMessageId((string) $row['header'])];
                         $failed++;
 

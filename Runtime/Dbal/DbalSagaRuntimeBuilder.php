@@ -42,8 +42,11 @@ use Storm\Saga\Outbox\Dbal\DbalWorkflowOutboxWriter;
 use Storm\Saga\Outbox\HopProtocol;
 use Storm\Saga\Outbox\WorkflowOutbox;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
+use Storm\Saga\Store\Dbal\DbalWorkflowStepWrites;
 use Storm\Saga\Store\Dbal\DbalWorkflowTimerStore;
+use Storm\Saga\Store\SequentialWorkflowStepWrites;
 use Storm\Saga\Store\WorkflowInstanceStore;
+use Storm\Saga\Store\WorkflowStepWrites;
 use Storm\Saga\Store\WorkflowTimerStore;
 use Storm\Serializer\DefaultMessageSerializer;
 use Storm\Serializer\MessageSerializer;
@@ -237,11 +240,25 @@ final class DbalSagaRuntimeBuilder
                 new RaceSettler($outbox, $clock),
                 new FamilyGate($instances, $extraction),
             ),
-            new StepCommitter($instances, $instances, $timers, $outbox, $clock, $this->calendar),
+            new StepCommitter($instances, $instances, $timers, $outbox, $clock, $this->calendar, $this->stepWrites($connection, $outbox)),
             $clock,
             $events,
         );
 
         return new Engine($this->registry, $executor, $instances, $writer, $this->logger);
+    }
+
+    /**
+     * The step's single-statement writer when both stores are the DBAL ones this builder owns; a
+     * caller that handed in its own instances or timers keeps the sequential composition, so what it
+     * injected is what the step writes through.
+     */
+    private function stepWrites(Connection $connection, WorkflowOutbox $outbox): WorkflowStepWrites
+    {
+        if ($this->instances !== null || $this->timers !== null) {
+            return new SequentialWorkflowStepWrites($this->instances ?? new DbalWorkflowInstanceStore($connection), $this->timers ?? new DbalWorkflowTimerStore($connection), $outbox);
+        }
+
+        return new DbalWorkflowStepWrites($connection, $this->serializer ?? new DefaultMessageSerializer);
     }
 }

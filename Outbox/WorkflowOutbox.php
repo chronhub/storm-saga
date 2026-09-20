@@ -6,7 +6,9 @@ namespace Storm\Saga\Outbox;
 
 use Storm\Contracts\Serializer\SerializationExceptionContract;
 use Storm\Message\Exception\InvalidMessageException;
+use Storm\Message\Message;
 use Storm\Saga\Exception\SagaStorageFailure;
+use Storm\Saga\Store\OutboxEntry;
 use Storm\Saga\Store\WorkflowId;
 
 /**
@@ -37,6 +39,23 @@ final readonly class WorkflowOutbox
     public function write(WorkflowId $id, object $command, string $issuedFromState, int $issuedAtVersion, int $generation, ?string $effectGroup = null): void
     {
         $this->writer->write($id, $this->protocol->seal($id, $command), $issuedFromState, $issuedAtVersion, $generation, $effectGroup);
+    }
+
+    /**
+     * Seal a command for this saga's hop without writing it, for a step that writes its commands in one
+     * statement with the rest of its effects.
+     */
+    public function seal(WorkflowId $id, object $command): Message
+    {
+        return $this->protocol->seal($id, $command);
+    }
+
+    /**
+     * Write an already sealed command, the entry a step folded before writing.
+     */
+    public function writeEntry(WorkflowId $id, OutboxEntry $entry): void
+    {
+        $this->writer->write($id, $entry->message, $entry->issuedFromState, $entry->issuedAtVersion, $entry->generation, $entry->effectGroup);
     }
 
     /**

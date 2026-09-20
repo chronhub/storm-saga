@@ -102,13 +102,19 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
                        -- nor consumed nor moved, staying due at their ORIGINAL instants to fire at
                        -- the first cycle after the resume. The GLOBAL deadline claims through the
                        -- pause on purpose: the hard cap is not negotiable by an operator window.
+                       -- Each pause probe is guarded by its uncorrelated twin, an InitPlan evaluated
+                       -- once per claim: with nothing paused anywhere, the common case, no candidate
+                       -- pays the per-row probe, which under a flood cost more than the claim itself.
+                       -- The instance guard rides the partial index on paused rows.
                        AND (t.kind = \'global\' OR (
-                            NOT EXISTS (SELECT 1 FROM workflow_pauses p WHERE p.workflow_type = t.workflow_type)
-                            AND NOT EXISTS (
+                            (NOT EXISTS (SELECT 1 FROM workflow_pauses)
+                             OR NOT EXISTS (SELECT 1 FROM workflow_pauses p WHERE p.workflow_type = t.workflow_type))
+                            AND (NOT EXISTS (SELECT 1 FROM workflow_instances WHERE paused_at IS NOT NULL)
+                             OR NOT EXISTS (
                                 SELECT 1 FROM workflow_instances i
                                 WHERE i.workflow_type = t.workflow_type AND i.correlation_id = t.correlation_id
                                   AND i.paused_at IS NOT NULL
-                            )
+                            ))
                        ))
                      ORDER BY t.fire_at
                      LIMIT :limit

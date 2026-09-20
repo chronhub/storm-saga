@@ -218,6 +218,7 @@ final class SagaSchemaCatalog
             'workflow_instances_waived_idx' => 'WHERE (waived_at IS NOT NULL)',
             'workflow_instances_children_idx' => 'WHERE (parent_correlation_id IS NOT NULL)',
             'workflow_instances_root_idx' => 'WHERE (root_correlation_id IS NOT NULL)',
+            'workflow_instances_paused_idx' => 'WHERE (paused_at IS NOT NULL)',
         ],
         'workflow_correlations' => [
             'workflow_correlations_spent_uq' => "WHERE (reuse = 'reject'",

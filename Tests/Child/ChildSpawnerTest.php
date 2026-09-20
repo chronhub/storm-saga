@@ -349,6 +349,13 @@ final class ChildSpawnerTest extends TestCase
         {
             public function __construct(private ChildSpawnerTest $test, private ?WorkflowInstanceRow $parent) {}
 
+            public function idByCorrelation(string $correlationId): ?WorkflowId
+            {
+                $row = $this->parent;
+
+                return $row === null ? null : new WorkflowId($row->workflowType, $row->correlationId);
+            }
+
             public function findByCorrelation(string $correlationId): ?WorkflowInstanceRow
             {
                 return $this->parent;

@@ -30,6 +30,8 @@ interface SagaCommandPublisher
      * `$workflowType` lets a publisher route a workflow's commands onto its OWN priority lane for
      * per-workflow finish-over-start, not just a single global one.
      *
+     * @throws RejectedCommandExecution when execution is explicitly permanent; the relay dead-letters
+     *                                  immediately while keeping effect evidence unknown
      * @throws UnrecoverableCommandDispatch when the command can never be delivered, such as no handler or
      *                                      an invalid payload; the relay dead-letters the row immediately
      * @throws Throwable any other delivery failure; the relay treats it as transient, backs off, then

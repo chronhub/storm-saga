@@ -71,6 +71,7 @@ use Storm\Saga\Semaphore\SemaphoreClient;
 use Storm\Saga\Semaphore\SemaphoreWorkflow;
 use Storm\Saga\Semaphore\SweepActivity;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
+use Storm\Saga\Store\Dbal\DbalWorkflowStepWrites;
 use Storm\Saga\Store\Dbal\DbalWorkflowTimerStore;
 use Storm\Saga\Store\DueTimerQueue;
 use Storm\Saga\Store\Inspection\SagaInspectionGateway;
@@ -79,6 +80,7 @@ use Storm\Saga\Store\WorkflowFamilies;
 use Storm\Saga\Store\WorkflowInstances;
 use Storm\Saga\Store\WorkflowInstanceStore;
 use Storm\Saga\Store\WorkflowPauses;
+use Storm\Saga\Store\WorkflowStepWrites;
 use Storm\Saga\Store\WorkflowTimers;
 use Storm\Saga\Store\WorkflowTimerStore;
 
@@ -182,6 +184,8 @@ return static function (ContainerConfigurator $container): void {
     $services->alias(WorkflowOutboxWriter::class, DbalWorkflowOutboxWriter::class);
     $services->alias(WorkflowCommandStore::class, DbalWorkflowOutboxWriter::class);
     $services->alias(FailedWorkflowCommands::class, DbalWorkflowOutboxWriter::class);
+    $services->set(DbalWorkflowStepWrites::class);
+    $services->alias(WorkflowStepWrites::class, DbalWorkflowStepWrites::class);
     $services->set(HopProtocol::class);
     $services->set(WorkflowOutbox::class);
 

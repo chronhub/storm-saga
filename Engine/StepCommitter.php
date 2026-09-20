@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace Storm\Saga\Engine;
 
-use Storm\Clock\Exception\InvalidDateTimeException;
 use Storm\Clock\PointInTime;
 use Storm\Contracts\Clock\Clock;
 use Storm\Contracts\Clock\ClockExceptionContract;
-use Storm\Contracts\Serializer\SerializationExceptionContract;
 use Storm\Saga\Build\WorkflowRegistry;
 use Storm\Saga\Calendar\BusinessCalendar;
 use Storm\Saga\Child\CancelChildWorkflow;
@@ -35,12 +33,14 @@ use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStateRejected;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
 use Storm\Saga\Outbox\WorkflowOutbox;
-use Storm\Saga\Store\TimerKind;
+use Storm\Saga\Store\OutboxEntry;
+use Storm\Saga\Store\SequentialWorkflowStepWrites;
 use Storm\Saga\Store\WorkflowFamilies;
 use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowInstances;
 use Storm\Saga\Store\WorkflowStatus;
+use Storm\Saga\Store\WorkflowStepWrites;
 use Storm\Saga\Store\WorkflowTimers;
 use Storm\Saga\Workflow\ActivityState;
 use Storm\Saga\Workflow\ScheduleState;
@@ -61,6 +61,8 @@ use Throwable;
  */
 final readonly class StepCommitter
 {
+    private WorkflowStepWrites $writes;
+
     /**
      * @param  Clock<PointInTime>  $clock
      */
@@ -71,7 +73,10 @@ final readonly class StepCommitter
         private WorkflowOutbox $outbox,
         private Clock $clock,
         private ?BusinessCalendar $calendar = null,
-    ) {}
+        ?WorkflowStepWrites $writes = null,
+    ) {
+        $this->writes = $writes ?? new SequentialWorkflowStepWrites($instances, $timers, $outbox);
+    }
 
     /**
      * Persist a birth: stamp the fan-out families, prove the adoption, gate the declared state,
@@ -96,40 +101,24 @@ final readonly class StepCommitter
         $this->proveAdoption($registry, $stamped);
         $this->guardDeclaredState($def, $stamped);
         $born = $stamped->claimedAs($this->instances->create($stamped, $def->reuse));
-        $this->applyEffects($id, $def, $born, $outcome->timerOps, $outcome->commands, $signal);
+        [$effects, $entries] = $this->settle($id, $def, $born, $outcome->timerOps, $outcome->commands, $signal);
+        $this->writes->applyEffects($id, $effects, $entries);
 
         return $born;
     }
 
-    /**
-     * Persist an advance: stamp the fan-out families, gate the declared state, update under OCC,
-     * and apply the effects.
-     *
-     * @throws StaleWorkflowInstance when a competing step moved the OCC version underneath
-     * @throws WorkflowStateRejected when the declared validator refuses the bag
-     * @throws ChildrenStillRunning when a nominal settle would orphan living children
-     * @throws SagaStorageFailure when the saga storage fails
-     * @throws Throwable the tail of the effects, re-thrown
-     */
     public function updated(WorkflowDefinition $def, WorkflowId $id, Updated $outcome, Signal $signal): void
     {
         $stamped = $this->familiesStamped($def, $outcome->row, $outcome->commands);
         $this->guardDeclaredState($def, $stamped);
-        $this->instances->update($stamped); // OCC: WHERE version = loaded version
-        $this->applyEffects($id, $def, $stamped, $outcome->timerOps, $outcome->commands, $signal);
+        [$effects, $entries] = $this->settle($id, $def, $stamped, $outcome->timerOps, $outcome->commands, $signal);
+        // OCC: WHERE version = loaded version, and every effect above hangs off that one row
+        $this->writes->commitAdvance($stamped, $effects, $entries);
     }
 
-    /**
-     * Persist an escalation: timers only, the row untouched.
-     *
-     * @throws SagaStorageFailure when the saga storage fails
-     * @throws ClockExceptionContract when the clock yields a non-canonical instant
-     */
     public function escalated(WorkflowId $id, Effects $outcome): void
     {
-        foreach ($outcome->timerOps as $op) {
-            $this->applyTimerOp($id, $op);
-        }
+        $this->writes->applyEffects($id, $this->folded($outcome->timerOps), []);
     }
 
     /**
@@ -274,29 +263,20 @@ final readonly class StepCommitter
     }
 
     /**
-     * Apply the collected effects within the step's transaction: the ordered `TimerOp`s, the issued
-     * commands, the settling member's poke to its parent, and the settle-cleanup. A settled saga's pending timers are moot, dropped
-     * conditionally: only the resting state's timer when that state arms one, and the global deadline
-     * when the workflow declares one; crossings already dropped the left states' via their cancel ops.
+     * The effects of a settled row, folded and sealed but not yet written: the timers as final effects
+     * per key, the commands as sealed outbox entries, and the recall, cascade, completion guard and
+     * family poke a non-running rest owes, which run here in their order. The writer then persists the
+     * row and the returned effects as one unit.
      *
-     * @param  list<TimerOp>  $ops  applied strictly in order, leave-then-re-enter: `cancel X … arm X`
+     * @param  list<TimerOp>  $ops
      * @param  list<IssuedCommand>  $commands
-     * @param  Signal  $signal  the step's trigger: an abort settle reads its `reason` and `force`
-     *                          for the cascade, inherited as-is; an operator who forces the root
-     *                          wants the tree dead, a nominal cascade compensates properly
+     * @return array{0: StepEffects, 1: list<OutboxEntry>}
      *
-     * @throws ChildrenStillRunning when a NOMINAL settle would orphan living children; the step rolls back
-     * @throws InvalidChildIdentity when a child row carries a malformed parent declaration
-     * @throws InvalidDateTimeException when a timer's fire instant cannot be derived from `now`
-     * @throws SerializationExceptionContract when an issued command is not a serializable payload
-     * @throws SagaStorageFailure when the saga storage fails, with driver failures wrapped by the adapter
-     * @throws ClockExceptionContract when the clock yields a non-canonical instant
+     * @throws ChildrenStillRunning when a nominal completion would orphan living children
      */
-    private function applyEffects(WorkflowId $id, WorkflowDefinition $def, WorkflowInstanceRow $resting, array $ops, array $commands, Signal $signal): void
+    private function settle(WorkflowId $id, WorkflowDefinition $def, WorkflowInstanceRow $resting, array $ops, array $commands, Signal $signal): array
     {
-        foreach ($ops as $op) {
-            $this->applyTimerOp($id, $op);
-        }
+        $effects = $this->folded($ops);
 
         if ($resting->aborted()) {
             // The settle's recall, sibling of the timer cleanup below. An ABORTING saga, halted or
@@ -362,20 +342,7 @@ final readonly class StepCommitter
                     $id->correlationId,
                 ), $resting->stateKey, $resting->version, $resting->generation);
             }
-        }
 
-        $this->fanOutMatchesItsArms($def, $commands);
-
-        foreach ($commands as $issued) {
-            // provenance rides to the row: the issuing state and the step marker, the resting row's OCC
-            // version, unique per step, distinct across a cycle's re-visits; the settle's pairing input.
-            // A command issued FROM a race or join state is stamped with its arm's effect_group,
-            // resolved by command class, the targeted recall's key; the preflight above proved the
-            // fan-out's shape, one command per arm, none smuggled, none missing, none doubled.
-            $this->outbox->write($id, $issued->command, $issued->fromState, $resting->version, $resting->generation, $issued->effectGroup ?? $this->raceGroupFor($def, $issued) ?? $this->joinGroupFor($def, $issued));
-        }
-
-        if ($resting->status !== WorkflowStatus::Running) {
             // Cancel only what could exist. A halt in place,
             // a timeout that halts/compensates rather than transitions, strands its fired timer, so drop
             // the resting state's, but only when that state arms one: a completion rests on a FinalState,
@@ -383,12 +350,32 @@ final readonly class StepCommitter
             // DELETE. Likewise, the global deadline is only when the workflow declares one. A crossing already
             // dropped the left states' timers via their cancel ops.
             if ($this->restingStateMayHaveTimer($def->state($resting->stateKey))) {
-                $this->timers->cancel($id, $resting->stateKey);
+                $effects = $effects->withCancel($resting->stateKey);
             }
             if ($def->globalTimeout !== null) {
-                $this->timers->cancel($id, WorkflowTimers::GLOBAL_KEY);
+                $effects = $effects->withCancel(WorkflowTimers::GLOBAL_KEY);
             }
         }
+
+        $this->fanOutMatchesItsArms($def, $commands);
+
+        $entries = [];
+        foreach ($commands as $issued) {
+            // provenance rides to the row: the issuing state and the step marker, the resting row's OCC
+            // version, unique per step, distinct across a cycle's re-visits; the settle's pairing input.
+            // A command issued FROM a race or join state is stamped with its arm's effect_group,
+            // resolved by command class, the targeted recall's key; the preflight above proved the
+            // fan-out's shape, one command per arm, none smuggled, none missing, none doubled.
+            $entries[] = new OutboxEntry(
+                $this->outbox->seal($id, $issued->command),
+                $issued->fromState,
+                $resting->version,
+                $resting->generation,
+                $issued->effectGroup ?? $this->raceGroupFor($def, $issued) ?? $this->joinGroupFor($def, $issued),
+            );
+        }
+
+        return [$effects, $entries];
     }
 
     /**
@@ -507,26 +494,30 @@ final readonly class StepCommitter
     }
 
     /**
-     * The one place the clock turns a relative instruction into a fire instant, floored to 1s.
+     * The one place the clock turns a relative instruction into a fire instant, floored to 1s, then the
+     * ordered operations folded to their final effects per key.
+     *
+     * @param  list<TimerOp>  $ops
      *
      * @throws SagaStorageFailure when the saga storage fails, with driver failures wrapped by the adapter
      * @throws ClockExceptionContract when the clock yields a non-canonical instant
      */
-    private function applyTimerOp(WorkflowId $id, TimerOp $op): void
+    private function folded(array $ops): StepEffects
     {
-        match ($op->kind) {
-            TimerOpKind::ArmTimeout => $this->timers->arm($id, $op->stateKey, TimerKind::Timeout, $this->armAt($op)),
-            TimerOpKind::ArmGlobal => $this->timers->arm($id, $op->stateKey, TimerKind::Global, $this->armAt($op)),
-            TimerOpKind::ArmKick => $this->timers->arm($id, $op->stateKey, TimerKind::Kick, $this->kickAt($op->delayMs)),
-            TimerOpKind::ArmSchedule => $this->timers->arm($id, $op->stateKey, TimerKind::Schedule, $this->scheduleAt($op)),
-            TimerOpKind::CancelState, TimerOpKind::CancelGlobal => $this->timers->cancel($id, $op->stateKey),
-        };
+        $resolved = [];
+        foreach ($ops as $op) {
+            $resolved[] = ['op' => $op, 'fireAt' => match ($op->kind) {
+                TimerOpKind::ArmTimeout, TimerOpKind::ArmGlobal => $this->armAt($op),
+                TimerOpKind::ArmKick => $this->kickAt($op->delayMs),
+                TimerOpKind::ArmSchedule => $this->scheduleAt($op),
+                // a cancel needs no instant; the clock's now keeps the shape uniform and is never read
+                TimerOpKind::CancelState, TimerOpKind::CancelGlobal => $this->clock->now(),
+            }];
+        }
+
+        return StepEffects::fold($resolved);
     }
 
-    /**
-     * @throws ClockExceptionContract when the clock yields a non-canonical instant
-     * @throws BusinessCalendarMissing when a business-time arm has no BusinessCalendar bound
-     */
     private function armAt(TimerOp $op): PointInTime
     {
         if ($op->businessDays !== null || $op->businessHours !== null) {

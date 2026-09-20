@@ -208,6 +208,13 @@ final class ChildCancellerTest extends TestCase
         {
             public function __construct(private ?WorkflowInstanceRow $child) {}
 
+            public function idByCorrelation(string $correlationId): ?WorkflowId
+            {
+                $row = $this->child;
+
+                return $row === null ? null : new WorkflowId($row->workflowType, $row->correlationId);
+            }
+
             public function findByCorrelation(string $correlationId): ?WorkflowInstanceRow
             {
                 return $this->child;

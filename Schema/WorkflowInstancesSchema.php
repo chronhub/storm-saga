@@ -141,6 +141,12 @@ final class WorkflowInstancesSchema
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_instances_root_idx ON workflow_instances (root_correlation_id) WHERE root_correlation_id IS NOT NULL
                 SQL,
+            // the paused rows alone, an operator's handful: the timer claim asks "is anything paused"
+            // once per claim off this index before it probes any candidate, and `paused_at` is
+            // written only by the operator, so the index costs the hot path nothing
+            <<<'SQL'
+                CREATE INDEX IF NOT EXISTS workflow_instances_paused_idx ON workflow_instances (workflow_type, correlation_id) WHERE paused_at IS NOT NULL
+                SQL,
         ];
     }
 
