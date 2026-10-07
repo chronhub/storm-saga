@@ -7,6 +7,7 @@ namespace Storm\Saga\Semaphore;
 use Storm\Saga\Engine\SagaEngine;
 use Storm\Saga\Exception\SagaFenceBusy;
 use Storm\Saga\Exception\SagaOutcomeNotYetApplicable;
+use Storm\Saga\Exception\SagaStateTooLarge;
 use Storm\Saga\Semaphore\Command\GrantSlot;
 use Storm\Saga\Semaphore\Event\SemaphoreSlotGranted;
 use Storm\Saga\Semaphore\Event\SemaphoreSlotRefused;
@@ -97,7 +98,10 @@ final readonly class SemaphoreClient
      * Ask a slot for the waiter and tell it what happened: a `Granted` or `Rejected` answer is also
      * DELIVERED to the waiter as its wait-state event, so the waiting saga advances the same way
      * whether the slot came now or from a later promotion; a `Queued` answer delivers nothing yet.
-     * Idempotent by token: redelivering the calling message re-asks and gets the same answer.
+     * A storage-budget refusal is delivered like a full queue, after the rejected step rolls back.
+     * This includes a holder that would not fit despite free logical capacity. Configured capacities
+     * are upper bounds, not reserved storage. Errors outside this acquisition are not translated.
+     * Idempotent for a stored holder or queue entry; a refusal reserves nothing and may change on retry.
      *
      * @throws SemaphoreUnavailable when no provisioned semaphore answers for the resource
      * @throws SagaFenceBusy when a concurrent verb holds the resource's fence; the transport redelivers
@@ -107,11 +111,20 @@ final readonly class SemaphoreClient
      */
     public function acquireFor(string $resource, string $waiterType, string $waiterCorrelation, ?int $grantTtlSeconds = null): Granted|Queued|Rejected
     {
-        $reply = $this->engine->signalFor(
-            self::WORKFLOW_TYPE,
-            $resource,
-            new Acquire($waiterType, $waiterCorrelation, $grantTtlSeconds),
-        );
+        try {
+            $reply = $this->engine->signalFor(
+                self::WORKFLOW_TYPE,
+                $resource,
+                new Acquire($waiterType, $waiterCorrelation, $grantTtlSeconds),
+            );
+        } catch (SagaStateTooLarge $error) {
+            if ($error->workflowType !== self::WORKFLOW_TYPE || $error->correlationId !== $resource || $error->limitBytes === null) {
+                throw $error;
+            }
+
+            // The engine has rolled back this step before surfacing the storage refusal.
+            $reply = new Rejected(null, $error->limitBytes);
+        }
 
         if (! $reply instanceof Granted && ! $reply instanceof Queued && ! $reply instanceof Rejected) {
             throw SemaphoreUnavailable::for($resource);

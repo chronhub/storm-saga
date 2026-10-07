@@ -10,13 +10,14 @@ use Throwable;
 /**
  * The immutable verdict an `Activity` returns. Built only through the named factories so the outcome
  * combinations stay valid: `success` carries the updated `vars`; `failure` carries the error and an
- * optional cause; `async` carries the id of the work dispatched elsewhere, after which the saga waits for
- * the resulting event.
+ * optional cause; `async` carries an informative work reference while the activity rests for a wake
+ * that re-executes it. An async result must not emit commands.
  *
- * `success` and `async` may also carry `commands` to issue: the engine writes them to the saga outbox in
+ * `success` may carry `commands` to issue: the engine writes them to the saga outbox in
  * the step's transaction, atomic with the state advance, and a relay dispatches them to the command bus
  * after commit. The activity stays pure, returning intent while the step does the I/O, and each command
- * must be a `SerializablePayload` so it can be stored durably.
+ * must be a `SerializablePayload` so it can be stored durably. A compensable emitting state must
+ * declare `compensationConfirmedBy` and select an immediate `WaitState`, including fallback success.
  *
  * @see Activity
  * @see \Storm\Contracts\Message\SerializablePayload
@@ -25,7 +26,7 @@ final readonly class ActivityResult
 {
     /**
      * @param  array<string, mixed>  $vars
-     * @param  list<object>  $commands  commands to issue durably, on success or async only
+     * @param  list<object>  $commands  command intent; the engine accepts emissions only on success
      * @param  int|null  $retryAfterSeconds  the downstream-requested next-attempt delay, failure only
      */
     private function __construct(
@@ -78,7 +79,7 @@ final readonly class ActivityResult
      * `$vars`.
      *
      * @param  array<string, mixed>  $vars
-     * @param  list<object>  $commands  commands to issue durably, such as the work being dispatched
+     * @param  list<object>  $commands  must be empty; the engine rejects async emissions as an authoring error
      */
     public static function async(string $asyncId, array $vars = [], array $commands = []): self
     {

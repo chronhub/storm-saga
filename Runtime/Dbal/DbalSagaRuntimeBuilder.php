@@ -25,6 +25,7 @@ use Storm\Saga\Engine\FamilyGate;
 use Storm\Saga\Engine\JoinSettler;
 use Storm\Saga\Engine\MachineRunner;
 use Storm\Saga\Engine\RaceSettler;
+use Storm\Saga\Engine\RecallJudge;
 use Storm\Saga\Engine\State\ActivityRunner;
 use Storm\Saga\Engine\State\FinalRunner;
 use Storm\Saga\Engine\State\ScheduleRunner;
@@ -224,18 +225,20 @@ final class DbalSagaRuntimeBuilder
         $timers = $this->timers ?? new DbalWorkflowTimerStore($connection);
         $writer = new DbalWorkflowOutboxWriter($connection, $this->serializer ?? new DefaultMessageSerializer);
         $outbox = new WorkflowOutbox(new HopProtocol($this->context ?? ContextValues::empty()), $writer);
+        $recalls = new RecallJudge($outbox);
 
         $executor = new StepExecutor(
             new PgAdvisoryFence($connection),
-            new StepLoader($instances, $instances, $timers),
+            new StepLoader($instances, $instances, $timers, $writer),
             new StepPolicy,
             new StepPerformer(
                 $machine,
                 $compensator,
+                $recalls,
                 new WaitEscalator,
-                new DeadlineEnforcer($machine, $compensator),
-                new FailedEffectSettler($compensator),
-                new Canceller($compensator),
+                new DeadlineEnforcer($machine, $compensator, $recalls),
+                new FailedEffectSettler($compensator, $recalls),
+                new Canceller($compensator, $recalls),
                 new JoinSettler($outbox, $clock, $extraction),
                 new RaceSettler($outbox, $clock),
                 new FamilyGate($instances, $extraction),
@@ -245,7 +248,7 @@ final class DbalSagaRuntimeBuilder
             $events,
         );
 
-        return new Engine($this->registry, $executor, $instances, $writer, $this->logger);
+        return new Engine($this->registry, $executor, $instances, $this->logger);
     }
 
     /**

@@ -10,6 +10,7 @@ use Storm\Saga\Engine\SagaOperator;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Outbox\Dbal\DbalWorkflowOutboxWriter;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
+use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Support\Console\PositiveIntOption;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -82,7 +83,7 @@ final class SagaCleanupCommand extends Command
     {
         $this->addOption('before', null, InputOption::VALUE_REQUIRED, 'Prune rows older than this (e.g. 30d, 48h, 90m; m is minutes) — required');
         $this->addOption('include-failed', null, InputOption::VALUE_NONE, 'Also prune halted / compensated instances (default: completed only)');
-        $this->addOption('batch', null, InputOption::VALUE_REQUIRED, 'Rows deleted per batch', '1000');
+        $this->addOption('batch', null, InputOption::VALUE_REQUIRED, 'Rows per reconcile or delete batch', '1000');
         $this->addOption('dry-run', null, InputOption::VALUE_NONE, 'Count what would be pruned, delete nothing');
     }
 
@@ -176,13 +177,14 @@ final class SagaCleanupCommand extends Command
         }
 
         $io->section(sprintf('%d waived saga(s) parked quiet — awaiting a late outcome or app-side reconciliation', count($waived)));
-        foreach ($waived as $row) {
-            $io->writeln(sprintf(
+        $io->writeln(array_map(
+            static fn (WorkflowInstanceRow $row): string => sprintf(
                 '  %s %s — at "%s" since %s (waived %s)',
                 $row->workflowType, $row->correlationId, $row->stateKey,
                 $row->startedAt?->toString() ?? '?', $row->waivedAt?->toString() ?? '?',
-            ));
-        }
+            ),
+            $waived,
+        ));
     }
 
     /**
@@ -193,12 +195,10 @@ final class SagaCleanupCommand extends Command
      * re-derives the durable truth of failed outbox rows whose saga is still running and replays
      * `failIssuedEffect`, idempotent, a no-op once the saga has moved past the wait.
      *
-     * The pass is BOUNDED, ORDERED and isolated per item: the scan reads one deterministic page,
-     * since the other producer of failed rows, the consumer-side dead-letter, is a MASS event and
-     * not the rare crash window; and one throwing settle is recorded and skipped rather than
-     * aborting the pass, so a persistent poison cannot decide, run after run, which sagas behind
-     * it never get reconciled. Settled rows leave the result set, so repeated runs drain the
-     * backlog page by page while the poison keeps failing loud.
+     * The pass uses bounded pages ordered by outbox id, up to the maximum id observed at its start.
+     * Every visited row advances the cursor, including a no-op or a failed settle. Later generated
+     * ids wait for the next invocation, which also retries unresolved candidates from the start.
+     * One throwing settle is reported and skipped rather than aborting the remaining pages.
      *
      * @param  positive-int  $batch
      * @return array{int, int} stranded sagas settled, or in dry-run the candidates found; and the settles that failed and were skipped
@@ -213,10 +213,10 @@ final class SagaCleanupCommand extends Command
         }
 
         // the domain-meaningful port query; the money-path scan is testable against any adapter
-        $stranded = $this->instances->strandedByFailedEffect($batch);
+        $stranded = $this->instances->iterateStrandedByFailedEffect($batch);
 
         if ($dryRun) {
-            return [count($stranded), 0];
+            return [iterator_count($stranded), 0];
         }
 
         $settled = 0;

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Storm\Saga\Console;
 
+use Closure;
 use Override;
 use Storm\Saga\Schedule\TimerRunner;
 use Storm\Support\Console\DaemonLoop;
@@ -45,6 +46,8 @@ final class RunTimersCommand extends Command
 
     public function __construct(
         private readonly TimerRunner $runner,
+        /** @var Closure(): void|null */
+        private readonly ?Closure $afterIteration = null,
     ) {
         parent::__construct();
     }
@@ -78,7 +81,7 @@ final class RunTimersCommand extends Command
             return $this->daemon($io, $input, $batch);
         }
 
-        $tick = $this->runner->tick($batch);
+        $tick = $this->iterate($batch);
         // the phrase is kept intact: the drain contract of the runbook reads it, and so do its tests
         $io->success(sprintf('Processed %d due saga timer(s).', $tick->processed));
 
@@ -100,7 +103,7 @@ final class RunTimersCommand extends Command
         $processed = 0;
 
         $this->daemonLoop(function () use ($batch, &$processed): int {
-            $n = $this->runner->tick($batch)->processed;
+            $n = $this->iterate($batch)->processed;
             $processed += $n;
 
             return $n;
@@ -109,5 +112,20 @@ final class RunTimersCommand extends Command
         $io->success(sprintf('Saga timers daemon stopped — processed %d due timer(s).', $processed));
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * @param  int<1, max>  $batch
+     */
+    private function iterate(int $batch): \Storm\Saga\Schedule\TimerTick
+    {
+        try {
+            return $this->runner->tick($batch);
+        } finally {
+            try {
+                $this->afterIteration?->__invoke();
+            } catch (Throwable) {
+            }
+        }
     }
 }

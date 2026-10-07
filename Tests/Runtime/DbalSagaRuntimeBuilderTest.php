@@ -30,7 +30,9 @@ use Storm\Saga\Outbox\HopProtocol;
 use Storm\Saga\Outbox\WorkflowOutbox;
 use Storm\Saga\Runtime\Dbal\DbalSagaRuntimeBuilder;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
+use Storm\Saga\Store\Dbal\DbalWorkflowStepWrites;
 use Storm\Saga\Store\Dbal\DbalWorkflowTimerStore;
+use Storm\Saga\Store\SequentialWorkflowStepWrites;
 use Storm\Saga\Store\WorkflowInstanceStore;
 use Storm\Saga\Store\WorkflowTimerStore;
 use Storm\Saga\Tests\Fixture\MutableClock;
@@ -195,6 +197,46 @@ final class DbalSagaRuntimeBuilderTest extends TestCase
         $activity = $this->grab($machine, MachineRunner::class, 'activity');
         self::assertInstanceOf(ActivityRunner::class, $activity);
         self::assertSame($breaker, $this->grab($activity, ActivityRunner::class, 'breaker'));
+    }
+
+    #[Test]
+    public function the_step_writes_go_atomic_only_over_the_stores_this_builder_owns(): void
+    {
+        // the single-statement writer embeds the DBAL stores' own statements, so it is right only
+        // when both stores are the builder's; a store handed in receives the step's writes itself,
+        // and the codec handed in is the one the atomic writer serializes with
+        $serializer = new DefaultMessageSerializer;
+        $instances = $this->createStub(WorkflowInstanceStore::class);
+        $timers = $this->createStub(WorkflowTimerStore::class);
+
+        $owned = $this->stepWrites($this->builder()->serializer($serializer));
+        self::assertInstanceOf(DbalWorkflowStepWrites::class, $owned);
+        self::assertSame($serializer, $this->grab($owned, DbalWorkflowStepWrites::class, 'serializer'));
+        $bare = $this->stepWrites($this->builder());
+        self::assertInstanceOf(DbalWorkflowStepWrites::class, $bare);
+        self::assertInstanceOf(DefaultMessageSerializer::class, $this->grab($bare, DbalWorkflowStepWrites::class, 'serializer'));
+
+        $instancesOnly = $this->stepWrites($this->builder()->instances($instances));
+        self::assertInstanceOf(SequentialWorkflowStepWrites::class, $instancesOnly);
+        self::assertSame($instances, $this->grab($instancesOnly, SequentialWorkflowStepWrites::class, 'instances'));
+        self::assertInstanceOf(DbalWorkflowTimerStore::class, $this->grab($instancesOnly, SequentialWorkflowStepWrites::class, 'timers'));
+
+        $timersOnly = $this->stepWrites($this->builder()->timers($timers));
+        self::assertInstanceOf(SequentialWorkflowStepWrites::class, $timersOnly);
+        self::assertInstanceOf(DbalWorkflowInstanceStore::class, $this->grab($timersOnly, SequentialWorkflowStepWrites::class, 'instances'));
+        self::assertSame($timers, $this->grab($timersOnly, SequentialWorkflowStepWrites::class, 'timers'));
+    }
+
+    private function stepWrites(DbalSagaRuntimeBuilder $builder): object
+    {
+        $executor = $this->grab($builder->build(), Engine::class, 'executor');
+        self::assertInstanceOf(StepExecutor::class, $executor);
+        $committer = $this->grab($executor, StepExecutor::class, 'committer');
+        self::assertInstanceOf(StepCommitter::class, $committer);
+        $writes = $this->grab($committer, StepCommitter::class, 'writes');
+        self::assertIsObject($writes);
+
+        return $writes;
     }
 
     private function builder(?StubEventResolver $resolver = null): DbalSagaRuntimeBuilder

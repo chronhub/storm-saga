@@ -32,6 +32,7 @@ use Storm\Saga\Exception\UnattributedRaceCommand;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStateRejected;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\WorkflowOutbox;
 use Storm\Saga\Store\OutboxEntry;
 use Storm\Saga\Store\SequentialWorkflowStepWrites;
@@ -43,6 +44,7 @@ use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Store\WorkflowStepWrites;
 use Storm\Saga\Store\WorkflowTimers;
 use Storm\Saga\Workflow\ActivityState;
+use Storm\Saga\Workflow\CompensationStatus;
 use Storm\Saga\Workflow\ScheduleState;
 use Storm\Saga\Workflow\State;
 use Storm\Saga\Workflow\WaitState;
@@ -101,7 +103,7 @@ final readonly class StepCommitter
         $this->proveAdoption($registry, $stamped);
         $this->guardDeclaredState($def, $stamped);
         $born = $stamped->claimedAs($this->instances->create($stamped, $def->reuse));
-        [$effects, $entries] = $this->settle($id, $def, $born, $outcome->timerOps, $outcome->commands, $signal);
+        [$effects, $entries] = $this->settle($id, $def, $born, $born->version, $outcome->timerOps, $outcome->commands, $signal);
         $this->writes->applyEffects($id, $effects, $entries);
 
         return $born;
@@ -111,7 +113,7 @@ final readonly class StepCommitter
     {
         $stamped = $this->familiesStamped($def, $outcome->row, $outcome->commands);
         $this->guardDeclaredState($def, $stamped);
-        [$effects, $entries] = $this->settle($id, $def, $stamped, $outcome->timerOps, $outcome->commands, $signal);
+        [$effects, $entries] = $this->settle($id, $def, $stamped, $stamped->version + 1, $outcome->timerOps, $outcome->commands, $signal);
         // OCC: WHERE version = loaded version, and every effect above hangs off that one row
         $this->writes->commitAdvance($stamped, $effects, $entries);
     }
@@ -274,23 +276,30 @@ final readonly class StepCommitter
      *
      * @throws ChildrenStillRunning when a nominal completion would orphan living children
      */
-    private function settle(WorkflowId $id, WorkflowDefinition $def, WorkflowInstanceRow $resting, array $ops, array $commands, Signal $signal): array
+    private function settle(WorkflowId $id, WorkflowDefinition $def, WorkflowInstanceRow $resting, int $committedVersion, array $ops, array $commands, Signal $signal): array
     {
         $effects = $this->folded($ops);
 
         if ($resting->aborted()) {
             // The settle's recall, sibling of the timer cleanup below. An ABORTING saga, halted or
             // rolled back, never a normal completion whose pending commands may be legitimate
-            // fire-and-forget, recalls every command still `pending` in its outbox: never claimed
-            // by the relay, so still recallable, whether the issuing step declared a
-            // compensation. Runs BEFORE the compensation's own commands are written, same tx, they
-            // survive by ordering; what the relay already claimed stays published, row locks
-            // arbitrate. A forced cancel's residual risk is commands genuinely
-            // dispatched.
-            $this->outbox->cancelPending($id);
+            // fire-and-forget, recalls its run's forward commands still `pending`, whether the
+            // issuing step declared a compensation. An undo, a cascade or a poke is never touched,
+            // the saga owing it, and another run's rows are left to that run; a row under a
+            // running lease is the relay's to finish. An undone step keeps its do, which the undo
+            // issued for it pairs with. The recall judgment uses persisted rows; a compensable
+            // emission rests in an explicit wait before a later step can abort. A forced cancel's
+            // residual risk is commands genuinely dispatched.
+            $undone = [];
+            foreach ($resting->compensations as $entry) {
+                if ($entry->status === CompensationStatus::Compensated) {
+                    $undone[] = $entry;
+                }
+            }
+            $this->outbox->cancelPending($id, $resting->generation, $undone);
 
-            // The cascade, one CancelChildWorkflow per living child, written AFTER the recall so the
-            // rows survive by the same ordering the compensation commands rely on. Always on an abort,
+            // The cascade, one CancelChildWorkflow per living child, written as control traffic that
+            // no recall touches, the saga owing it to its children. Always on an abort,
             // no knob: a detached process has its own door, the reaction that starts a saga. The waive
             // never reaches this block, a waived row keeps running. Transitivity is emergent: each
             // cancelled child settles through this same seam and cascades to its own children.
@@ -302,7 +311,7 @@ final readonly class StepCommitter
                     $child->correlationId,
                     $signal->reason,
                     $signal->force,
-                ), $resting->stateKey, $resting->version, $resting->generation);
+                ), $resting->stateKey, $committedVersion, $resting->generation, CommandPurpose::Control);
             }
         }
 
@@ -325,8 +334,8 @@ final readonly class StepCommitter
             // The family endgame's heal, written on the SETTLE and not on a conclusion, because only
             // a member's own terminal settle can complete its family: it is the last thing that
             // happens in the system before a parent holding an absorbed conclusion would sit at its
-            // wait forever. Placed after the recall above and for the same reason the cascade is: an
-            // aborting member mows its pending rows, and this one must survive that.
+            // wait forever. Written as control traffic for the same reason the cascade is: an
+            // aborting member mows its pending forward rows, and this one must survive that.
             //
             // Narrowed to a member of an INDEXED family, read off the slot's own grammar, so a
             // static-slot child costs nothing. The narrowing is exact rather than merely cheap: only
@@ -340,7 +349,7 @@ final readonly class StepCommitter
                     $ref->correlationId,
                     $id->workflowType,
                     $id->correlationId,
-                ), $resting->stateKey, $resting->version, $resting->generation);
+                ), $resting->stateKey, $committedVersion, $resting->generation, CommandPurpose::Control);
             }
 
             // Cancel only what could exist. A halt in place,
@@ -361,16 +370,20 @@ final readonly class StepCommitter
 
         $entries = [];
         foreach ($commands as $issued) {
-            // provenance rides to the row: the issuing state and the step marker, the resting row's OCC
-            // version, unique per step, distinct across a cycle's re-visits; the settle's pairing input.
+            // Provenance uses the version this step commits, distinct from birth and across state
+            // revisits. The row retains its loaded version for the writer's OCC predicate.
             // A command issued FROM a race or join state is stamped with its arm's effect_group,
             // resolved by command class, the targeted recall's key; the preflight above proved the
             // fan-out's shape, one command per arm, none smuggled, none missing, none doubled.
+            // A state fans out a race or a join, never both, so the two lookups cannot both answer
+            // and swapping their order is an equivalent mutant, left unignored on purpose: the
+            // explicit group's own Coalesce on this line is killed, and an ignore would mask it.
             $entries[] = new OutboxEntry(
                 $this->outbox->seal($id, $issued->command),
                 $issued->fromState,
-                $resting->version,
+                $committedVersion,
                 $resting->generation,
+                $issued->purpose,
                 $issued->effectGroup ?? $this->raceGroupFor($def, $issued) ?? $this->joinGroupFor($def, $issued),
             );
         }
@@ -436,12 +449,16 @@ final readonly class StepCommitter
                     ? MalformedRaceFanOut::armDuplicated($arm, $state->key, $def->name)
                     : MalformedJoinFanOut::armDuplicated($arm, $state->key, $def->name);
             }
+            // @infection-ignore-all; equivalent: a set, read by isset() alone, so the value is arbitrary
             $issuedArms[$state->key][$arm] = true;
             $fanOuts[$state->key] = $state;
         }
 
         foreach ($fanOuts as $stateKey => $state) {
             $race = $state->race;
+            // a state fans out a race or a join, never both, and `??` reads a property of the null one
+            // without a warning, so swapping the two lookups is an equivalent mutant, left unignored on
+            // purpose: the fallback's own Coalesce on this line is killed, and an ignore would mask it
             foreach ($race->arms ?? $state->join->arms ?? [] as $slot) {
                 if (! isset($issuedArms[$stateKey][$slot->name])) {
                     throw $race !== null

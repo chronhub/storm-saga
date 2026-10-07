@@ -117,12 +117,12 @@ final class SagaSchemaCompletenessTest extends TestCase
     }
 
     /**
-     * Every verified constraint is still declared, and a declared FRAGMENT appears verbatim in the
-     * rendered DDL: the probe compares it against `pg_get_constraintdef`, so a fragment the DDL no
-     * longer contains means either the catalog drifted or the fragment was never deparse-stable to
-     * begin with. The parameter carries the catalog's declared contract shape rather than the
-     * constant itself, so the fragment branch is read against that type and not against whichever
-     * values happen to sit in the list today.
+     * Every verified constraint is still declared, and a declared needle appears in the rendered DDL,
+     * a complete one in its declared form: the probe compares it against `pg_get_constraintdef`, so
+     * a needle the DDL no longer contains means either the catalog drifted or it was never
+     * deparse-stable to begin with. The parameter carries the catalog's declared contract shape
+     * rather than the constant itself, so the fragment branch is read against that type and not
+     * against whichever values happen to sit in the list today.
      *
      * @param  array<string, array<string, string|null>>  $constraintsByTable
      * @param  array<string, string>  $ddl
@@ -133,7 +133,7 @@ final class SagaSchemaCompletenessTest extends TestCase
             foreach ($constraints as $name => $fragment) {
                 self::assertStringContainsString('CONSTRAINT '.$name, $ddl[$table], sprintf('constraint %s is verified but no longer declared for %s', $name, $table));
                 if ($fragment !== null) {
-                    self::assertStringContainsString($fragment, $ddl[$table], sprintf("constraint %s: required fragment '%s' is not in the declared DDL for %s — the catalog drifted away from the schema", $name, $fragment, $table));
+                    self::assertStringContainsString(self::declaredForm($fragment), $ddl[$table], sprintf("constraint %s: required fragment '%s' is not in the declared DDL for %s — the catalog drifted away from the schema", $name, $fragment, $table));
                 }
             }
         }
@@ -238,5 +238,12 @@ final class SagaSchemaCompletenessTest extends TestCase
         self::assertNotSame([], $columns, 'no columns parsed from a CREATE TABLE body — the DDL no longer follows the one-column-per-line format this suite relies on');
 
         return $columns;
+    }
+
+    // a complete `CHECK` needle IS the deparse, which wraps the expression in one more pair of
+    // parentheses than the declared DDL writes: the DDL carries it with that pair removed
+    private static function declaredForm(string $needle): string
+    {
+        return str_starts_with($needle, 'CHECK ((') && str_ends_with($needle, '))') ? 'CHECK '.substr($needle, 7, -1) : $needle;
     }
 }

@@ -60,9 +60,9 @@ final readonly class SagaInspectionGateway
         return $this->connection->transactional(function (Connection $connection) use ($correlation, $type): array {
             $connection->executeStatement('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
 
-            /** @lang PostgreSQL */
             // the type freeze leaves NO stamp on its instances; without the EXISTS an inspect reads a
             // living saga as executable while its whole type is held
+            /* language=PostgreSQL */
             $sql = 'SELECT i.workflow_type, i.state_key, i.status, i.vars, i.retries, i.compensations, i.version, i.started_at,
                            i.updated_at, i.generation, i.definition_version, i.state_version, i.retry_total, i.retimes,
                            i.waived_at, i.global_deadline_consumed_at, i.paused_at, i.paused_reason,
@@ -176,9 +176,9 @@ final readonly class SagaInspectionGateway
         $types['n'] = ParameterType::INTEGER;
 
         $rows = $this->connection->fetchAllAssociative(
-            /** @lang PostgreSQL */
             // the type freeze leaves NO stamp on its instances, it lives in workflow_pauses alone, so
             // without this the widest freeze of the surface is invisible in every listing
+            /* language=PostgreSQL */
             'SELECT i.workflow_type, i.correlation_id, i.state_key, i.status, i.version, i.generation,
                     i.definition_version, i.retry_total, i.started_at, i.updated_at, i.waived_at, i.global_deadline_consumed_at,
                     i.paused_at, i.parent_correlation_id,
@@ -231,7 +231,7 @@ final readonly class SagaInspectionGateway
         $capped = max(1, min(self::MAX_LIMIT, $limit));
 
         $rows = $this->connection->fetchAllAssociative(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             "SELECT c.workflow_type, c.correlation_id, c.parent_correlation_id, p.status AS parent_status, c.started_at
              FROM workflow_instances c
              LEFT JOIN workflow_instances p ON p.correlation_id = c.parent_correlation_id
@@ -264,7 +264,7 @@ final readonly class SagaInspectionGateway
     private function children(string $parentCorrelation): array
     {
         $rows = $this->connection->fetchAllAssociative(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'SELECT workflow_type, correlation_id, status FROM workflow_instances
              WHERE parent_correlation_id = :corr ORDER BY correlation_id',
             ['corr' => $parentCorrelation],
@@ -285,7 +285,7 @@ final readonly class SagaInspectionGateway
     private function timers(string $type, string $correlation): array
     {
         $rows = $this->connection->fetchAllAssociative(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'SELECT id, kind, state_key, fire_at, claimed_at, attempts, parked_at, last_error FROM workflow_timers
              WHERE workflow_type = :type AND correlation_id = :corr ORDER BY fire_at',
             ['type' => $type, 'corr' => $correlation],
@@ -311,8 +311,8 @@ final readonly class SagaInspectionGateway
     private function outbox(string $type, string $correlation): array
     {
         $rows = $this->connection->fetchAllAssociative(
-            /** @lang PostgreSQL */
             sprintf(
+                /* language=PostgreSQL */
                 "SELECT status, bus, attempts, header->>'%s' AS command, header->>'%s' AS message_id,
                         created_at, last_error, issued_from_state, issued_at_version, generation, evidence, effect_group
                  FROM workflow_outbox WHERE workflow_type = :type AND correlation_id = :corr ORDER BY id",

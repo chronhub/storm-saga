@@ -39,7 +39,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
     {
         $this->guard(function () use ($id, $stateKey, $kind, $fireAt): null {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'INSERT INTO workflow_timers (workflow_type, correlation_id, state_key, kind, fire_at)
                  VALUES (:type, :corr, :state, :kind, :fire_at)
                  ON CONFLICT (workflow_type, correlation_id, state_key, kind)
@@ -82,7 +82,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
 
         return $this->guard(fn (): array => $this->connection->transactional(function (Connection $connection) use ($limit, $nowStr, $leaseCutoff): array {
             $wins = (bool) $connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))',
                 ['key' => self::CLAIM_LOCK_KEY],
             );
@@ -92,7 +92,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
             }
 
             $rows = $connection->fetchAllAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'UPDATE workflow_timers SET claimed_at = :claimed
                  WHERE id IN (
                      SELECT t.id FROM workflow_timers t
@@ -138,7 +138,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
     {
         $this->guard(function () use ($id, $stateKey): null {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'DELETE FROM workflow_timers WHERE workflow_type = :type AND correlation_id = :corr AND state_key = :state',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId, 'state' => $stateKey],
             );
@@ -150,7 +150,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
     public function recordFailure(int $id, string $error): int
     {
         return $this->guard(fn (): int => (int) $this->connection->fetchOne(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'UPDATE workflow_timers SET attempts = attempts + 1, last_error = :error
              WHERE id = :id
              RETURNING attempts',
@@ -163,7 +163,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
     {
         $this->guard(function () use ($id, $error): null {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'UPDATE workflow_timers SET parked_at = clock_timestamp(), last_error = :error
                  WHERE id = :id',
                 ['error' => $error, 'id' => $id],
@@ -181,7 +181,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
             // a row that was never parked IS the predicate, so a concurrent arm() cannot slip between
             // a check and an update and have this reset a budget the arm just granted
             $unparked = $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'UPDATE workflow_timers SET parked_at = NULL, attempts = 0, last_error = NULL
                  WHERE id = :id AND parked_at IS NOT NULL',
                 ['id' => $id],
@@ -196,7 +196,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
     {
         return $this->guard(function () use ($id, $stateKey, $kind): ?PointInTime {
             $raw = $this->connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT fire_at FROM workflow_timers
                  WHERE workflow_type = :type AND correlation_id = :corr AND state_key = :state AND kind = :kind',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId, 'state' => $stateKey, 'kind' => $kind->value],
@@ -210,7 +210,7 @@ final readonly class DbalWorkflowTimerStore implements WorkflowTimerStore
     {
         return $this->guard(function () use ($id): array {
             $rows = $this->connection->fetchAllAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT id, workflow_type, correlation_id, state_key, kind, fire_at
                  FROM workflow_timers WHERE workflow_type = :type AND correlation_id = :corr ORDER BY fire_at',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId],

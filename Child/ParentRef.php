@@ -110,10 +110,13 @@ final readonly class ParentRef
             throw InvalidChildIdentity::malformedParentContext('the entry must be an array');
         }
 
-        foreach (['type', 'correlation', 'root', 'slot'] as $field) {
-            if (! isset($raw[$field]) || ! is_string($raw[$field])) {
-                throw InvalidChildIdentity::malformedParentContext(sprintf('"%s" must be a string', $field));
-            }
+        $invalidField = array_find(
+            ['type', 'correlation', 'root', 'slot'],
+            static fn (string $field): bool => ! isset($raw[$field]) || ! is_string($raw[$field]),
+        );
+
+        if ($invalidField !== null) {
+            throw InvalidChildIdentity::malformedParentContext(sprintf('"%s" must be a string', $invalidField));
         }
 
         if (! isset($raw['depth']) || ! is_int($raw['depth'])) {

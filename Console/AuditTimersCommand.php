@@ -7,6 +7,7 @@ namespace Storm\Saga\Console;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception;
+use Doctrine\DBAL\ParameterType;
 use JsonException;
 use Override;
 use Storm\Saga\Build\WorkflowRegistry;
@@ -38,6 +39,12 @@ use Throwable;
  * step lets a second worker take it. Exit FAILURE while a timer is beyond its tempo and not
  * re-armed, SUCCESS otherwise.
  *
+ * Visits timers in increasing id order up to the initial maximum id, without a transaction
+ * snapshot. Each page is rendered and optionally re-armed before reading the next one. Memory
+ * depends on page contents and workflow definitions, rather than the full timer population.
+ * JSON is streamed as one document; an interrupted run can leave an incomplete document and
+ * already re-armed pages remain committed.
+ *
  * Examples:
  *
  * ```bash
@@ -55,6 +62,8 @@ use Throwable;
 #[AsCommand(name: 'storm:saga:timers:audit', description: 'Name the live saga timers armed further out than the tempo their workflow declares, the trace of a clock that jumped, and re-arm them to now on demand.')]
 final class AuditTimersCommand extends Command
 {
+    private const int PAGE_SIZE = 1000;
+
     public function __construct(
         private readonly Connection $connection,
         private readonly WorkflowRegistry $registry,
@@ -83,56 +92,88 @@ final class AuditTimersCommand extends Command
         $type = $input->getOption('type');
         $type = is_string($type) && $type !== '' ? $type : null;
 
-        // the instance's pinned definition version rides along: a tempo that changed between two
-        // versions is judged for the version the instance was born under, never the latest
-        /** @var list<array{id: int|string, workflow_type: string, correlation_id: string, state_key: string, kind: string, ahead: int|string, definition_version: int|string|null}> $rows */
-        $rows = $this->connection->fetchAllAssociative(
-            /* language=PostgreSQL */
-            'SELECT t.id, t.workflow_type, t.correlation_id, t.state_key, t.kind, EXTRACT(EPOCH FROM (t.fire_at - clock_timestamp()))::int AS ahead, i.definition_version
-             FROM workflow_timers t
-             LEFT JOIN workflow_instances i ON i.workflow_type = t.workflow_type AND i.correlation_id = t.correlation_id
-             WHERE t.parked_at IS NULL'.($type === null ? '' : ' AND t.workflow_type = :type').' ORDER BY t.workflow_type, t.fire_at',
-            $type === null ? [] : ['type' => $type],
-        );
-
-        $beyond = [];
+        $ceiling = $this->connection->fetchOne('SELECT max(id) FROM workflow_timers');
+        $cursor = null;
+        $read = 0;
+        $beyondCount = 0;
         $notJudged = 0;
-        $definitions = [];
-        foreach ($rows as $row) {
-            $version = $row['definition_version'] === null ? null : (int) $row['definition_version'];
-            $definitions[$row['workflow_type'].'@'.($version ?? 'latest')] ??= $this->definition($row['workflow_type'], $version);
-            $tempo = $this->tempo($definitions[$row['workflow_type'].'@'.($version ?? 'latest')], $row['state_key'], $row['kind']);
-            if ($tempo === null) {
-                $notJudged++;
-
-                continue;
-            }
-            if ((int) $row['ahead'] > $tempo) {
-                $beyond[] = ['id' => (int) $row['id'], 'workflow_type' => $row['workflow_type'], 'correlation_id' => $row['correlation_id'], 'state_key' => $row['state_key'], 'kind' => $row['kind'], 'ahead' => (int) $row['ahead'], 'tempo' => $tempo];
-            }
-        }
-
         $rearmed = 0;
-        if ($input->getOption('rearm') === true && $beyond !== []) {
-            $rearmed = (int) $this->connection->executeStatement(
+        $json = $input->getOption('json') === true;
+        if ($json) {
+            $output->write('{"beyond":[');
+        }
+
+        while ($ceiling !== null && $ceiling !== false) {
+            // the instance's pinned version determines its tempo, never the latest version
+            /** @var list<array{id: int|string, workflow_type: string, correlation_id: string, state_key: string, kind: string, ahead: int|string, definition_version: int|string|null}> $rows */
+            $rows = $this->connection->fetchAllAssociative(
                 /* language=PostgreSQL */
-                'UPDATE workflow_timers SET fire_at = clock_timestamp(), claimed_at = NULL WHERE id IN (:ids) AND parked_at IS NULL',
-                ['ids' => array_column($beyond, 'id')],
-                ['ids' => ArrayParameterType::INTEGER],
+                'SELECT t.id, t.workflow_type, t.correlation_id, t.state_key, t.kind, EXTRACT(EPOCH FROM (t.fire_at - clock_timestamp()))::int AS ahead, i.definition_version
+                 FROM workflow_timers t
+                 LEFT JOIN workflow_instances i ON i.workflow_type = t.workflow_type AND i.correlation_id = t.correlation_id
+                 WHERE t.parked_at IS NULL AND t.id <= :ceiling'
+                    .($cursor === null ? '' : ' AND t.id > :cursor')
+                    .($type === null ? '' : ' AND t.workflow_type = :type')
+                    .' ORDER BY t.id LIMIT :limit',
+                ['ceiling' => $ceiling, 'limit' => self::PAGE_SIZE]
+                    + ($cursor === null ? [] : ['cursor' => $cursor])
+                    + ($type === null ? [] : ['type' => $type]),
+                ['limit' => ParameterType::INTEGER],
             );
-        }
-
-        if ($input->getOption('json') === true) {
-            $output->writeln(json_encode(['beyond' => $beyond, 'not_judged' => $notJudged, 'rearmed' => $rearmed], JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-        } else {
-            if ($beyond !== []) {
-                $io->table(['Workflow', 'Correlation', 'State', 'Kind', 'Ahead (s)', 'Tempo (s)'], array_map(static fn (array $t): array => [$t['workflow_type'], $t['correlation_id'], $t['state_key'], $t['kind'], (string) $t['ahead'], (string) $t['tempo']], $beyond));
+            if ($rows === []) {
+                break;
             }
-            $line = sprintf('%d timer(s) read, %d beyond their tempo, %d not judged (business timeouts, kicks and schedules carry no tempo the audit can read)%s.', count($rows), count($beyond), $notJudged, $rearmed > 0 ? sprintf(', re-armed %d to now', $rearmed) : '');
-            $beyond === [] || $rearmed > 0 ? $io->success($line) : $io->error($line.' A timer beyond its tempo was armed by a clock ahead of the database\'s: fix the host\'s time, stop the timers loops, then --rearm.');
+            $cursor = $rows[array_key_last($rows)]['id'];
+            $read += count($rows);
+            $beyond = [];
+            $definitions = [];
+            foreach ($rows as $row) {
+                $version = $row['definition_version'] === null ? null : (int) $row['definition_version'];
+                $key = $row['workflow_type'].'@'.($version ?? 'latest');
+                if (! array_key_exists($key, $definitions)) {
+                    $definitions[$key] = $this->definition($row['workflow_type'], $version);
+                }
+                $tempo = $this->tempo($definitions[$key], $row['state_key'], $row['kind']);
+                if ($tempo === null) {
+                    $notJudged++;
+
+                    continue;
+                }
+                if ((int) $row['ahead'] > $tempo) {
+                    $beyond[] = ['id' => (int) $row['id'], 'workflow_type' => $row['workflow_type'], 'correlation_id' => $row['correlation_id'], 'state_key' => $row['state_key'], 'kind' => $row['kind'], 'ahead' => (int) $row['ahead'], 'tempo' => $tempo];
+                }
+            }
+
+            if ($input->getOption('rearm') === true && $beyond !== []) {
+                $rearmed += (int) $this->connection->executeStatement(
+                    /* language=PostgreSQL */
+                    'UPDATE workflow_timers SET fire_at = clock_timestamp(), claimed_at = NULL WHERE id IN (:ids) AND parked_at IS NULL',
+                    ['ids' => array_column($beyond, 'id')],
+                    ['ids' => ArrayParameterType::INTEGER],
+                );
+            }
+
+            if ($json) {
+                foreach ($beyond as $timer) {
+                    $output->write(($beyondCount > 0 ? ',' : '').json_encode($timer, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
+                    $beyondCount++;
+                }
+            } else {
+                $beyondCount += count($beyond);
+                if ($beyond !== []) {
+                    $io->table(['Workflow', 'Correlation', 'State', 'Kind', 'Ahead (s)', 'Tempo (s)'], array_map(static fn (array $t): array => [$t['workflow_type'], $t['correlation_id'], $t['state_key'], $t['kind'], (string) $t['ahead'], (string) $t['tempo']], $beyond));
+                }
+            }
         }
 
-        return $beyond === [] || $rearmed > 0 ? Command::SUCCESS : Command::FAILURE;
+        if ($json) {
+            $output->writeln(sprintf('],"not_judged":%d,"rearmed":%d}', $notJudged, $rearmed));
+        } else {
+            $line = sprintf('%d timer(s) read, %d beyond their tempo, %d not judged (business timeouts, kicks and schedules carry no tempo the audit can read)%s.', $read, $beyondCount, $notJudged, $rearmed > 0 ? sprintf(', re-armed %d to now', $rearmed) : '');
+            $beyondCount === 0 || $rearmed > 0 ? $io->success($line) : $io->error($line.' A timer beyond its tempo was armed by a clock ahead of the database\'s: fix the host\'s time, stop the timers loops, then --rearm.');
+        }
+
+        return $beyondCount === 0 || $rearmed > 0 ? Command::SUCCESS : Command::FAILURE;
     }
 
     /**

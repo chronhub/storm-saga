@@ -17,6 +17,7 @@ use Storm\Saga\Semaphore\SemaphoreLedger;
 use Storm\Saga\Semaphore\SlotToken;
 
 use function assert;
+use function is_string;
 
 final class SemaphoreLedgerTest extends TestCase
 {
@@ -220,6 +221,25 @@ final class SemaphoreLedgerTest extends TestCase
     }
 
     #[Test]
+    public function every_grant_carries_its_own_128_bit_id(): void
+    {
+        // the id fences a wake-up against the CURRENT holder, so a stale delivery meeting a newer
+        // grant is discarded: 128 random bits, hex-encoded, on an answered grant as on a promotion
+        $ledger = SemaphoreLedger::open($this->now, $this->vars(capacity: 1));
+        $ledger->acquire('payment', 'p-1');
+        $ledger->acquire('payment', 'p-2');
+        $answered = $ledger->vars()[SemaphoreLedger::HOLDERS][SlotToken::of('payment', 'p-1')]['grant_id'] ?? null;
+        assert(is_string($answered));
+
+        $ledger->release('payment', 'p-1');
+        $promoted = $ledger->grants()[0]->grantId;
+
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $answered);
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', (string) $promoted);
+        $this->assertNotSame($answered, $promoted);
+    }
+
+    #[Test]
     public function release_of_an_unknown_token_is_a_no_op(): void
     {
         $ledger = SemaphoreLedger::open($this->now, $this->vars());
@@ -359,6 +379,28 @@ final class SemaphoreLedgerTest extends TestCase
         $this->assertSame([], $ledger->vars()[SemaphoreLedger::QUEUE]);
         $this->assertSame([], $ledger->vars()[SemaphoreLedger::HOLDERS]);
         $this->assertSame([], $ledger->grants());
+    }
+
+    #[Test]
+    #[Group('adversarial')]
+    public function the_counters_count_only_what_the_reap_dropped(): void
+    {
+        // a living holder and a waiting entry stay beside the dead ones: the counters add what was
+        // dropped, never what remains, so a sum in place of the difference would read 3, not 1
+        $vars = $this->vars(capacity: 2, maxQueue: 2);
+        $vars[SemaphoreLedger::HOLDERS] = [
+            SlotToken::of('payment', 'p-dead') => $this->holder('p-dead', $this->now->subSeconds(1)->toString()),
+            SlotToken::of('payment', 'p-alive') => $this->holder('p-alive', $this->now->addSeconds(30)->toString()),
+        ];
+        $vars[SemaphoreLedger::QUEUE] = [
+            $this->entry('p-late', 60, $this->now->subSeconds(1)->toString()),
+            $this->entry('p-waiting', 60, $this->now->addSeconds(100)->toString()),
+        ];
+
+        $ledger = SemaphoreLedger::open($this->now, $vars);
+
+        $this->assertSame(1, $ledger->vars()[SemaphoreLedger::EXPROPRIATED]);
+        $this->assertSame(1, $ledger->vars()[SemaphoreLedger::LAPSED]);
     }
 
     #[Test]

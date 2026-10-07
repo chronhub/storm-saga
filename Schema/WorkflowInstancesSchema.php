@@ -76,7 +76,7 @@ final class WorkflowInstancesSchema
     public static function up(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE TABLE IF NOT EXISTS workflow_instances (
                     workflow_type  text   NOT NULL,
@@ -115,29 +115,29 @@ final class WorkflowInstancesSchema
                     CONSTRAINT workflow_instances_retimes_chk CHECK (retimes >= 0)
                 )
                 SQL,
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_instances_waived_idx ON workflow_instances (waived_at) WHERE waived_at IS NOT NULL
                 SQL,
             // composite: the terminal prune filters on both columns, and every plain `WHERE status`
             // query, the maintenance reads included, uses the prefix, so a separate single-column
             // status index would be redundant
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_instances_status_updated_idx ON workflow_instances (status, updated_at)
                 SQL,
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE UNIQUE INDEX IF NOT EXISTS workflow_instances_correlation_uq ON workflow_instances (correlation_id)
                 SQL,
             // the cascade and the zombie sweep both scan "the children of parent X"; children per
             // parent are few, static slots, so the partial index carries no status predicate and
             // serves every liveness filter
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_instances_children_idx ON workflow_instances (parent_correlation_id) WHERE parent_correlation_id IS NOT NULL
                 SQL,
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_instances_root_idx ON workflow_instances (root_correlation_id) WHERE root_correlation_id IS NOT NULL
                 SQL,
@@ -156,7 +156,7 @@ final class WorkflowInstancesSchema
     public static function down(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'DROP TABLE IF EXISTS workflow_instances',
         ];
     }

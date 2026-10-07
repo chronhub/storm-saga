@@ -222,6 +222,42 @@ final class WorkflowInstanceRowTest extends TestCase
     }
 
     #[Test]
+    public function a_second_arm_arrival_joins_the_first_in_its_state_ledger(): void
+    {
+        // the arrival ledger only grows: each completion appends to its state's list, and the join
+        // reads that whole list, so a later arrival must neither replace the earlier ones nor touch
+        // another state's ledger
+        $row = new WorkflowInstanceRow('payment', 'o-1', 'book', WorkflowStatus::Running, arms: ['ship' => ['courier']]);
+
+        $arrived = $row->armArrived('book', 'charge')->armArrived('book', 'reserve');
+
+        $this->assertSame(['ship' => ['courier'], 'book' => ['charge', 'reserve']], $arrived->arms);
+    }
+
+    #[Test]
+    public function a_later_fan_out_widens_the_family_expectation_it_already_holds(): void
+    {
+        // monotonic like the arms ledger: a second fan-out step adds its members to the family's
+        // expectation instead of replacing it, and another family keeps its own
+        $row = new WorkflowInstanceRow('parent', 'p-1', 'fan', WorkflowStatus::Running, families: ['audit' => 1]);
+
+        $this->assertSame(['audit' => 1, 'leg' => 5], $row->expectingFamily('leg', 2)->expectingFamily('leg', 3)->families);
+    }
+
+    #[Test]
+    public function a_forced_exit_keeps_the_global_deadline_it_already_consumed(): void
+    {
+        // the first routing into recovery is the one the row remembers; a later forced exit naming
+        // another instant stamps nothing new, while a row that never consumed it takes the given one
+        $consumed = PointInTime::from('2026-08-05T10:00:00.000000+00:00');
+        $later = PointInTime::from('2026-08-05T11:00:00.000000+00:00');
+        $row = new WorkflowInstanceRow('payment', 'o-1', 'charge', WorkflowStatus::Running, globalDeadlineConsumedAt: $consumed);
+
+        $this->assertSame($consumed, $row->forcedTo('failed', $later)->globalDeadlineConsumedAt);
+        $this->assertSame($later, new WorkflowInstanceRow('payment', 'o-2', 'charge', WorkflowStatus::Running)->forcedTo('failed', $later)->globalDeadlineConsumedAt);
+    }
+
+    #[Test]
     public function a_row_built_without_a_generation_is_the_first_run(): void
     {
         // the constructor default is load-bearing: a row hydrated from a pre-run-identity install, or

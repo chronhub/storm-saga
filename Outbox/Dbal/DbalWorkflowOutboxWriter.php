@@ -14,6 +14,7 @@ use Storm\Message\Message;
 use Storm\Saga\Engine\EffectEvidence;
 use Storm\Saga\Engine\EffectProvenance;
 use Storm\Saga\Exception\SagaStorageFailure;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\OutboxStatus;
 use Storm\Saga\Outbox\RedriveOutcome;
 use Storm\Saga\Outbox\WorkflowOutboxWriter;
@@ -78,15 +79,15 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
         private OutboxDisposal $disposal = OutboxDisposal::Delete,
     ) {}
 
-    public function write(WorkflowId $id, Message $message, string $issuedFromState, int $issuedAtVersion, int $generation, ?string $effectGroup = null): void
+    public function write(WorkflowId $id, Message $message, string $issuedFromState, int $issuedAtVersion, int $generation, CommandPurpose $purpose, ?string $effectGroup = null): void
     {
         ['header' => $header, 'content' => $content] = $this->serializer->serialize($message);
 
         try {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
-                'INSERT INTO workflow_outbox (workflow_type, correlation_id, bus, header, content, issued_from_state, issued_at_version, generation, effect_group)
-                 VALUES (:type, :corr, :bus, CAST(:header AS jsonb), CAST(:content AS jsonb), :from_state, :at_version, :generation, :effect_group)',
+                /* language=PostgreSQL */
+                'INSERT INTO workflow_outbox (workflow_type, correlation_id, bus, header, content, issued_from_state, issued_at_version, generation, purpose, effect_group)
+                 VALUES (:type, :corr, :bus, CAST(:header AS jsonb), CAST(:content AS jsonb), :from_state, :at_version, :generation, :purpose, :effect_group)',
                 [
                     'type' => $id->workflowType,
                     'corr' => $id->correlationId,
@@ -96,6 +97,7 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
                     'from_state' => $issuedFromState,
                     'at_version' => $issuedAtVersion,
                     'generation' => $generation,
+                    'purpose' => $purpose->value,
                     'effect_group' => $effectGroup,
                 ],
                 ['at_version' => ParameterType::INTEGER, 'generation' => ParameterType::INTEGER],
@@ -109,8 +111,8 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
     {
         try {
             $row = $this->connection->fetchAssociative(
-                /** @lang PostgreSQL */
                 sprintf(
+                    /* language=PostgreSQL */
                     "SELECT o.issued_from_state, o.evidence,
                             EXISTS(
                                 SELECT 1 FROM workflow_outbox s
@@ -154,8 +156,8 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
     {
         try {
             $flipped = $this->connection->executeStatement(
-                /** @lang PostgreSQL */
                 sprintf(
+                    /* language=PostgreSQL */
                     "UPDATE workflow_outbox
                      SET status = '%s', last_error = :error, evidence = :evidence, processed_at = clock_timestamp()
                      WHERE correlation_id = :corr AND header->>'%s' = :mid AND status = '%s'",
@@ -172,121 +174,169 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
         return $flipped > 0;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * The flip runs under the saga's own step fence, a `PgAdvisoryFence` over this writer's connection,
+     * so the lock, the guarded update and its diagnosis share one transaction. A step holding the fence
+     * is not waited for: the redrive stands down as `Raced` and changes nothing. Inside a caller's
+     * ambient transaction the flip is a savepoint and the fence stays held until the outer commit;
+     * `Redriven` then promises only what that transaction commits.
+     */
     public function redrive(string $correlationId, string $messageId, bool $force = false): RedriveOutcome
     {
         try {
-            // every guard lives in the predicate: the join to the instance decides "still running" and
-            // "current generation" in the same statement that flips the row, so nothing can settle,
-            // prune or re-run the saga between the decision and the write
-            $redriven = $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+            // the fence key, read from the row itself: the type and correlation never change after the insert
+            $workflowType = $this->connection->fetchOne(
                 sprintf(
-                    "UPDATE workflow_outbox o
-                     SET status = '%s', attempts = 0, last_error = NULL, processed_at = NULL, evidence = '%s'
-                     FROM workflow_instances i
-                     WHERE o.correlation_id = :corr AND o.header->>'%s' = :mid AND o.status = '%s'
-                       AND (o.evidence = '%s' OR :force)
-                       AND i.workflow_type = o.workflow_type AND i.correlation_id = o.correlation_id
-                       AND i.status = '%s' AND i.generation = o.generation",
-                    OutboxStatus::Pending->value,
-                    EffectEvidence::Unknown->value, // a row back in flight has proven nothing yet
-                    Header::MessageId->value,
-                    OutboxStatus::Failed->value,
-                    EffectEvidence::Uncommitted->value,
-                    WorkflowStatus::Running->value,
-                ),
-                ['corr' => $correlationId, 'mid' => $messageId, 'force' => $force],
-                ['force' => ParameterType::BOOLEAN],
-            );
-        } catch (Exception $e) {
-            throw SagaStorageFailure::unavailable($e);
-        }
-
-        return $redriven > 0 ? RedriveOutcome::Redriven : $this->whyNotRedriven($correlationId, $messageId, $force);
-    }
-
-    /**
-     * Which guard rejected it, asked ONLY after the update changed nothing. The decision was made
-     * atomically above; this read merely names it, so a diagnosis that raced with a concurrent settle
-     * can be slightly stale without ever having decided anything. An operator handed a bare "nothing
-     * happened" goes and edits SQL by hand, which is the outcome this whole verb exists to prevent.
-     *
-     * @throws SagaStorageFailure when the storage fails
-     */
-    private function whyNotRedriven(string $correlationId, string $messageId, bool $force): RedriveOutcome
-    {
-        try {
-            $row = $this->connection->fetchAssociative(
-                /** @lang PostgreSQL */
-                sprintf(
-                    "SELECT o.status, o.evidence, o.generation, i.status AS saga_status, i.generation AS saga_generation
-                     FROM workflow_outbox o
-                     LEFT JOIN workflow_instances i
-                       ON i.workflow_type = o.workflow_type AND i.correlation_id = o.correlation_id
-                     WHERE o.correlation_id = :corr AND o.header->>'%s' = :mid",
-                    Header::MessageId->value,
-                ),
+                    /* language=PostgreSQL */
+                    "SELECT workflow_type FROM workflow_outbox WHERE correlation_id = :corr AND header->>'%s' = :mid", Header::MessageId->value),
                 ['corr' => $correlationId, 'mid' => $messageId],
             );
+
+            if ($workflowType === false) {
+                return RedriveOutcome::NotFound;
+            }
         } catch (Exception $e) {
             throw SagaStorageFailure::unavailable($e);
         }
 
-        if ($row === false) {
-            return RedriveOutcome::NotFound;
-        }
+        $mutation = new DbalRedriveMutation($this->connection);
+        $messageIdClause = sprintf("o.header->>'%s' = :mid", Header::MessageId->value);
 
-        // ordered by what an operator can act on: the row's own state first, then the saga's, then the
-        // one refusal a --force can lift, which must be reported LAST so it is never the answer given
-        // for a saga that is beyond repair anyway
-        if ((string) $row['status'] !== OutboxStatus::Failed->value) {
-            return RedriveOutcome::NotDeadLettered;
-        }
-
-        if ($row['saga_status'] === null || (string) $row['saga_status'] !== WorkflowStatus::Running->value) {
-            return RedriveOutcome::SagaNotRunning;
-        }
-
-        if ((int) $row['saga_generation'] !== (int) $row['generation']) {
-            return RedriveOutcome::StaleGeneration;
-        }
-
-        if ((string) $row['evidence'] !== EffectEvidence::Uncommitted->value) {
-            return RedriveOutcome::EffectUnproven;
-        }
-
-        // every guard now reads as satisfied, yet the update changed nothing: the row moved between
-        // the two statements. Saying NotFound here, of a row just read, would be the diagnosis
-        // inventing a reason rather than reporting one.
-        return RedriveOutcome::Raced;
+        return $mutation->underFence(
+            new WorkflowId((string) $workflowType, $correlationId),
+            static fn (): RedriveOutcome => $mutation->flip(
+                'o.workflow_type = :type AND o.correlation_id = :corr AND '.$messageIdClause,
+                ['type' => (string) $workflowType, 'corr' => $correlationId, 'mid' => $messageId],
+                [],
+                $force,
+            )
+                ? RedriveOutcome::Redriven
+                : $mutation->diagnose('o.correlation_id = :corr AND '.$messageIdClause, ['corr' => $correlationId, 'mid' => $messageId]),
+        );
     }
 
-    public function cancelPending(WorkflowId $id, ?string $effectGroup = null): int
+    public function cancelPending(WorkflowId $id, int $generation, array $spared): int
     {
-        // Only `pending` rows move: a row the relay is claiming right now is row-locked
-        // with FOR UPDATE SKIP LOCKED; this UPDATE blocks on it, then re-evaluates it as published
-        // and leaves it alone. Keyed by (type, correlation): never another saga's rows. A non-null
-        // `$effectGroup` narrows the recall to ONE concurrent arm's rows, the race's targeted half,
-        // served by the group partial index, leaving sibling arms in flight.
+        // a row a drain is publishing right now carries a lease still running, and a row a drain is
+        // claiming right now is row-locked, this update blocking on it until the claim commits its
+        // lease: either way the row is left alone. Keyed by the type and the correlation, never
+        // another saga's rows
+        $params = ['type' => $id->workflowType, 'corr' => $id->correlationId, 'generation' => $generation];
+        $spare = '';
+        foreach ($spared as $i => $entry) {
+            // an undone entry's do stays owed to its undo; IS NOT DISTINCT FROM, since an ungrouped
+            // row carries a NULL group that no equality would ever match
+            $spare .= sprintf(' AND NOT (issued_from_state = :spared_state_%1$d AND effect_group IS NOT DISTINCT FROM :spared_group_%1$d)', $i);
+            $params['spared_state_'.$i] = $entry->step;
+            $params['spared_group_'.$i] = $entry->arm;
+        }
+
         try {
-            $sql = sprintf(
-                "UPDATE workflow_outbox
-                 SET status = '%s', processed_at = clock_timestamp()
-                 WHERE workflow_type = :type AND correlation_id = :corr AND status = '%s'",
-                OutboxStatus::Cancelled->value,
-                OutboxStatus::Pending->value,
+            return (int) $this->connection->executeStatement(
+                sprintf(
+                    /* language=PostgreSQL */
+                    "UPDATE workflow_outbox
+                     SET status = '%s', processed_at = clock_timestamp()
+                     WHERE workflow_type = :type AND correlation_id = :corr AND generation = :generation
+                       AND status = '%s' AND purpose = '%s'
+                       AND (claimed_until IS NULL OR claimed_until <= clock_timestamp())%s",
+                    OutboxStatus::Cancelled->value,
+                    OutboxStatus::Pending->value,
+                    CommandPurpose::Forward->value,
+                    $spare,
+                ),
+                $params,
+                ['generation' => ParameterType::INTEGER],
             );
-            $params = ['type' => $id->workflowType, 'corr' => $id->correlationId];
-
-            if ($effectGroup !== null) {
-                $sql .= ' AND effect_group = :effect_group';
-                $params['effect_group'] = $effectGroup;
-            }
-
-            return (int) $this->connection->executeStatement($sql, $params);
         } catch (Exception $e) {
             throw SagaStorageFailure::unavailable($e);
         }
+    }
+
+    public function recallUndispatched(WorkflowId $id, int $generation, string $issuedFromState, string $effectGroup): int
+    {
+        // served by the group partial index, the literal status matching its predicate; the NULL
+        // marker is what makes the count a proof, a row any relay ever took staying out of it
+        try {
+            return (int) $this->connection->executeStatement(
+                sprintf(
+                    /* language=PostgreSQL */
+                    "UPDATE workflow_outbox
+                     SET status = '%s', processed_at = clock_timestamp()
+                     WHERE workflow_type = :type AND correlation_id = :corr AND effect_group = :effect_group
+                       AND status = '%s' AND generation = :generation AND issued_from_state = :from_state
+                       AND purpose = '%s' AND claimed_until IS NULL",
+                    OutboxStatus::Cancelled->value,
+                    OutboxStatus::Pending->value,
+                    CommandPurpose::Forward->value,
+                ),
+                [
+                    'type' => $id->workflowType,
+                    'corr' => $id->correlationId,
+                    'effect_group' => $effectGroup,
+                    'generation' => $generation,
+                    'from_state' => $issuedFromState,
+                ],
+                ['generation' => ParameterType::INTEGER],
+            );
+        } catch (Exception $e) {
+            throw SagaStorageFailure::unavailable($e);
+        }
+    }
+
+    public function forwardClaims(WorkflowId $id, int $generation, string $issuedFromState, ?string $effectGroup): array
+    {
+        $params = [
+            'type' => $id->workflowType,
+            'corr' => $id->correlationId,
+            'generation' => $generation,
+            'from_state' => $issuedFromState,
+            'effect_group' => $effectGroup,
+        ];
+        $types = ['generation' => ParameterType::INTEGER];
+
+        try {
+            // the lock takes the rows no relay has claimed, in id order and never skipping, so a claim
+            // in flight is waited out and a locked row stays out of every claim until the step commits.
+            // A claimed row is left alone: its marker never goes back to NULL, and the relay batch that
+            // may still hold it would otherwise make the rollback wait on it, or deadlock
+            $this->connection->fetchFirstColumn(
+                sprintf(
+                    /* language=PostgreSQL */
+                    "SELECT id FROM workflow_outbox
+                     WHERE workflow_type = :type AND correlation_id = :corr AND generation = :generation
+                       AND issued_from_state = :from_state AND effect_group IS NOT DISTINCT FROM :effect_group
+                       AND purpose = '%s' AND claimed_until IS NULL
+                     ORDER BY id
+                     FOR UPDATE",
+                    CommandPurpose::Forward->value,
+                ),
+                $params,
+                $types,
+            );
+
+            // then every row's marker, whatever its status: a published or dead-lettered row is a claim
+            // the verdict must see, and a row that reads unclaimed here is one the lock above holds
+            $markers = $this->connection->fetchFirstColumn(
+                sprintf(
+                    /* language=PostgreSQL */
+                    "SELECT claimed_until FROM workflow_outbox
+                     WHERE workflow_type = :type AND correlation_id = :corr AND generation = :generation
+                       AND issued_from_state = :from_state AND effect_group IS NOT DISTINCT FROM :effect_group
+                       AND purpose = '%s'
+                     ORDER BY id",
+                    CommandPurpose::Forward->value,
+                ),
+                $params,
+                $types,
+            );
+        } catch (Exception $e) {
+            throw SagaStorageFailure::unavailable($e);
+        }
+
+        return array_map(static fn (mixed $marker): bool => $marker !== null, $markers);
     }
 
     /**
@@ -298,7 +348,7 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
     {
         try {
             return (int) $this->connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT count(*) FROM workflow_outbox WHERE '.self::prunable(),
                 ['age' => $ageSeconds],
             );
@@ -321,7 +371,7 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
     {
         try {
             return (int) $this->connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "SELECT count(*) FROM workflow_outbox_archive WHERE archived_at < now() - (CAST(:age AS bigint) * interval '1 second')",
                 ['age' => $ageSeconds],
             );
@@ -377,16 +427,16 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
     private function archivePublished(int $ageSeconds, int $batch): int
     {
         $sql = sprintf(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 WITH due AS (
                     SELECT id FROM workflow_outbox WHERE %s ORDER BY id LIMIT %d FOR UPDATE SKIP LOCKED
                 ), moved AS (
                     DELETE FROM workflow_outbox WHERE id IN (SELECT id FROM due)
-                    RETURNING id, workflow_type, correlation_id, bus, header, content, attempts, issued_from_state, issued_at_version, generation, evidence, created_at
+                    RETURNING id, workflow_type, correlation_id, bus, header, content, attempts, issued_from_state, issued_at_version, generation, evidence, purpose, created_at
                 )
-                INSERT INTO workflow_outbox_archive (id, workflow_type, correlation_id, bus, header, content, attempts, issued_from_state, issued_at_version, generation, evidence, created_at)
-                SELECT id, workflow_type, correlation_id, bus, header, content, attempts, issued_from_state, issued_at_version, generation, evidence, created_at FROM moved
+                INSERT INTO workflow_outbox_archive (id, workflow_type, correlation_id, bus, header, content, attempts, issued_from_state, issued_at_version, generation, evidence, purpose, created_at)
+                SELECT id, workflow_type, correlation_id, bus, header, content, attempts, issued_from_state, issued_at_version, generation, evidence, purpose, created_at FROM moved
                 SQL,
             self::publishedPrunable(),
             $batch,
@@ -404,8 +454,8 @@ final readonly class DbalWorkflowOutboxWriter implements WorkflowOutboxWriter
     /**
      * Prune the archive under `storm.saga.command_outbox.disposal: archive` by age; the cold table's
      * retention, entirely published-by-construction, served by the BRIN on `archived_at`. Under `delete`
-     * disposal the archive is empty and this is a no-op. Cannot race the live relay: the relay only ever
-     * INSERTs here as the atomic move, never reads.
+     * disposal the archive is empty and this is a no-op. Cannot race the live relay, which never touches
+     * the archive: its only writer is the move `archivePublished()` makes during the cleanup.
      *
      * @param  positive-int  $batch
      * @return int rows pruned

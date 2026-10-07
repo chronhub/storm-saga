@@ -40,7 +40,7 @@ final class InMemorySagaState
 
     public int $nextTimerId = 1;
 
-    /** @var array<int, array{id: int, workflowType: string, correlationId: string, bus: string, header: array<string, mixed>, content: array<string, mixed>, status: string, attempts: int, issuedFromState: string, issuedAtVersion: int, generation: int, effectGroup: string|null, evidence: string, lastError: string|null, createdAt: string, processedAt: string|null}> */
+    /** @var array<int, array{id: int, workflowType: string, correlationId: string, bus: string, header: array<string, mixed>, content: array<string, mixed>, status: string, attempts: int, issuedFromState: string, issuedAtVersion: int, generation: int, effectGroup: string|null, purpose: string, claimedUntil: string|null, evidence: string, lastError: string|null, createdAt: string, processedAt: string|null}> */
     public array $commands = [];
 
     public int $nextCommandId = 1;

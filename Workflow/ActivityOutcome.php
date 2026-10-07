@@ -8,8 +8,8 @@ use Storm\Saga\Attributes\OnTrigger;
 
 /**
  * The outcome an `Activity` reports via `ActivityResult`. `Success` and `Failure` map to the matching
- * `OnTrigger` transition; `Async` means the activity dispatched work and the result will arrive later as
- * an event, so the saga moves to a wait state and nothing transitions yet.
+ * `OnTrigger` transition; `Async` rests in the same activity without emitting commands. A subsequent
+ * wake re-executes the activity; its declared timeout bounds the stay.
  *
  * @see Activity
  * @see ActivityResult

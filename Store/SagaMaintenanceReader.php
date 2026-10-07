@@ -27,8 +27,8 @@ interface SagaMaintenanceReader
      * A DETERMINISTIC page, ordered by correlation then message id and bounded by `$limit`: a mass
      * dead-letter is also a producer of stranded rows, and an unbounded, planner-ordered scan
      * would make one invocation attempt every settle at once while a persistent poison reshuffles
-     * which sagas get reconciled run to run. Settled rows leave the result set, so repeated
-     * invocations drain the backlog page by page.
+     * which sagas get reconciled run to run. Unresolved rows remain in this first page; callers
+     * needing a full maintenance pass must use a separate advancing traversal.
      *
      * @param  positive-int  $limit
      * @return list<array{0: string, 1: string|null}> pairs of correlationId and sealed messageId

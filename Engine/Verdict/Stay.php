@@ -10,7 +10,7 @@ use Storm\Saga\Engine\TimerOp;
  * Rest in the same state: a retry waiting for its back-off kick, an async effect waiting for its
  * outcome, or a wait re-arming its timeout. Carries the authoritative new `$vars`, the per-state
  * attempt counters when a retry consumed budget, the relative timer instructions to arm, and any
- * commands issued, since an async activity issues durably then rests.
+ * commands from runners whose waiting protocol permits emission. Ordinary async activities emit none.
  */
 final readonly class Stay implements Verdict
 {

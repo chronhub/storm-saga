@@ -6,9 +6,9 @@ namespace Storm\Saga\Engine\Plan;
 
 /**
  * Stop this saga on an operator's word: halt where it sits and roll back what is safe to undo, with
- * positional eligibility, since progression proves completion; an unconfirmed in-flight step is
- * skipped and flagged, never blindly compensated. Planned only when the policy allowed the cancel;
- * an unforced cancel at an effect-gating wait is refused.
+ * positional eligibility, save the steps whose commands the recall proves never left; an unconfirmed
+ * in-flight step is skipped and flagged, never blindly compensated. Planned only when the policy
+ * allowed the cancel; an unforced cancel at an effect-gating wait is refused.
  *
  * @see SkipReason::InFlightEffect
  */

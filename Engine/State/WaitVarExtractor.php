@@ -66,18 +66,16 @@ final readonly class WaitVarExtractor
         }
 
         if ($state->extractMap === []) {
-            // @infection-ignore-all; equivalent: falls through to the identical `return $vars` below, since the foreach over an empty map is a no-op
+            // @infection-ignore-all; equivalent: falls through to the `array_replace` below, which returns `$vars` unchanged for an empty map
             return $vars;
         }
 
         $payload = $this->events->payloadFor($event);
-        foreach ($state->extractMap as $target => $field) {
-            if (! array_key_exists($field, $payload)) {
-                throw MissingExtractField::inWait($field, $state->key);
-            }
-            $vars[$target] = $payload[$field];
+        $missing = array_find($state->extractMap, static fn (string $field): bool => ! array_key_exists($field, $payload));
+        if ($missing !== null) {
+            throw MissingExtractField::inWait($missing, $state->key);
         }
 
-        return $vars;
+        return array_replace($vars, array_map(static fn (string $field): mixed => $payload[$field], $state->extractMap));
     }
 }

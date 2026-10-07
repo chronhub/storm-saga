@@ -31,21 +31,20 @@ final class TransitionSelector
     public function select(State $state, OnTrigger $trigger, array $vars, ?string $eventClass = null): ?string
     {
         // a transition scoped to exactly this event class wins over a catch-all
-        foreach ($state->transitions as $transition) {
-            if ($transition->trigger === $trigger && $transition->onEvent !== null
-                && $transition->onEvent === $eventClass && $this->passes($transition, $vars)) {
-                return $transition->to;
-            }
-        }
+        $scoped = array_find(
+            $state->transitions,
+            fn (Transition $transition): bool => $transition->trigger === $trigger && $transition->onEvent !== null
+                && $transition->onEvent === $eventClass && $this->passes($transition, $vars),
+        );
 
         // then the catch-all with no onEvent; it covers every non-event trigger too
-        foreach ($state->transitions as $transition) {
-            if ($transition->trigger === $trigger && $transition->onEvent === null && $this->passes($transition, $vars)) {
-                return $transition->to;
-            }
-        }
+        $selected = $scoped ?? array_find(
+            $state->transitions,
+            fn (Transition $transition): bool => $transition->trigger === $trigger && $transition->onEvent === null
+                && $this->passes($transition, $vars),
+        );
 
-        return null;
+        return $selected?->to;
     }
 
     /**

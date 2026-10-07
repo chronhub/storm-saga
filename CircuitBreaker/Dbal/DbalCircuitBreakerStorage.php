@@ -83,7 +83,7 @@ final readonly class DbalCircuitBreakerStorage implements CircuitBreakerStorage
         // reset, half-open/open to closed, or failures > 0, matches the WHERE and writes.
         $this->guard(function (string $key) use ($closed): null {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "UPDATE circuit_breaker SET state = '$closed', failures = 0, opened_at = NULL
                  WHERE key = :key AND (state <> '$closed' OR failures <> 0)",
                 ['key' => $key],
@@ -106,7 +106,7 @@ final readonly class DbalCircuitBreakerStorage implements CircuitBreakerStorage
         $this->guard(function (string $key) use ($open, $closed, $threshold): null {
             // positional params: the threshold is compared four times; '?' avoids reusing a named placeholder
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "INSERT INTO circuit_breaker (key, state, failures, opened_at)
                  VALUES (?, CASE WHEN 1 >= ? THEN '$open' ELSE '$closed' END, 1, CASE WHEN 1 >= ? THEN clock_timestamp() ELSE NULL END)
                  ON CONFLICT (key) DO UPDATE SET

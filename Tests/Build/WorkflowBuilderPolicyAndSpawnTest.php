@@ -182,7 +182,7 @@ final class WorkflowBuilderPolicyAndSpawnTest extends TestCase
         $wf = new #[Workflow(name: 'floor')]
         #[State(key: 'work', type: 'activity', activity: RecordingActivity::class)]
         #[State(key: 'done', type: 'final')]
-        #[Retry(state: 'work', maxAttempts: 1, maxElapsedSeconds: 1, maxRequestedDelaySeconds: 1)]
+        #[Retry(state: 'work', maxAttempts: 1, maxElapsedSeconds: 1, maxRequestedDelaySeconds: 1, maxBackoffMs: 1)]
         #[On(from: 'work', trigger: 'success', to: 'done')]
         class {};
 
@@ -193,6 +193,40 @@ final class WorkflowBuilderPolicyAndSpawnTest extends TestCase
         $this->assertSame(1, $state->retry->maxAttempts);
         $this->assertSame(1, $state->retry->maxElapsedSeconds);
         $this->assertSame(1, $state->retry->maxRequestedDelaySeconds);
+        $this->assertSame(1, $state->retry->maxBackoffMs);
+    }
+
+    #[Test]
+    public function an_undeclared_backoff_cap_builds_as_one_minute(): void
+    {
+        // the attribute's default is what every #[Retry] without a cap ships with
+        $wf = new #[Workflow(name: 'default_cap')]
+        #[State(key: 'work', type: 'activity', activity: RecordingActivity::class)]
+        #[State(key: 'done', type: 'final')]
+        #[Retry(state: 'work', maxAttempts: 3)]
+        #[On(from: 'work', trigger: 'success', to: 'done')]
+        class {};
+
+        $state = $this->builder()->build($wf)->state('work');
+
+        $this->assertInstanceOf(ActivityState::class, $state);
+        $this->assertNotNull($state->retry);
+        $this->assertSame(60_000, $state->retry->maxBackoffMs);
+    }
+
+    #[Test]
+    public function rejects_a_non_positive_backoff_cap(): void
+    {
+        $wf = new #[Workflow(name: 'bad')]
+        #[State(key: 'work', type: 'activity', activity: RecordingActivity::class)]
+        #[State(key: 'done', type: 'final')]
+        #[Retry(state: 'work', maxAttempts: 3, maxBackoffMs: 0)]
+        #[On(from: 'work', trigger: 'success', to: 'done')]
+        class {};
+
+        $this->expectException(InvalidWorkflowDefinition::class);
+        $this->expectExceptionMessageMatches('/maxBackoffMs.*must be >= 1/');
+        $this->builder()->build($wf);
     }
 
     #[Test]

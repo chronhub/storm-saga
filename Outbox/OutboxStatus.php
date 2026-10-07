@@ -18,12 +18,15 @@ namespace Storm\Saga\Outbox;
  *   re-derives a lost settle from it, so it must survive any prune; once the saga settled or its row is
  *   gone it is forensic audit, prunable by age.
  *
- * - `Cancelled`: recalled by an aborting settle before the relay claimed it, never dispatched;
- *   audit-only, prunable purely by age.
+ * - `Cancelled`: recalled before any relay published it. The status alone never certifies the command
+ *   never left, its claim marker does: a row cancelled with no marker was never taken by a relay, the
+ *   non-event an arm's proving recall and a rollback's recall read, while an abort's recall also stops
+ *   a row a relay tried and released. Audit-only, prunable purely by age.
  *
  * @see SagaOutboxRelay drives the pending to published or failed transitions inline in its drain SQL
  * @see WorkflowOutboxWriter::markFailed() the consumer-side published to failed flip
- * @see WorkflowOutboxWriter::cancelPending() the pending to cancelled recall
+ * @see WorkflowOutboxWriter::cancelPending() the abort's pending to cancelled recall
+ * @see WorkflowOutboxWriter::recallUndispatched() the arm's proving recall
  */
 enum OutboxStatus: string
 {

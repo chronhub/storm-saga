@@ -6,6 +6,7 @@ namespace Storm\Saga\Engine;
 
 use Storm\Contracts\Clock\ClockExceptionContract;
 use Storm\Saga\Engine\Run\Rested;
+use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Workflow\WorkflowDefinition;
 
@@ -19,15 +20,18 @@ final readonly class FailedEffectSettler
 {
     public function __construct(
         private Compensator $compensator,
+        private RecallJudge $recalls,
     ) {}
 
     /**
+     * @throws SagaStorageFailure when the recall's rows cannot be read and locked; the step rolls back whole
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      */
     public function settle(WorkflowDefinition $def, WorkflowInstanceRow $row, ?string $causationId): Rested
     {
         $halted = $row->halted();
+        $carried = new Rested($halted);
 
-        return $this->compensator->compensate($def, $halted, new Rested($halted), $causationId, locationAgnostic: false);
+        return $this->compensator->compensate($def, $halted, $carried, $causationId, locationAgnostic: false, recalled: $this->recalls->judge($carried));
     }
 }

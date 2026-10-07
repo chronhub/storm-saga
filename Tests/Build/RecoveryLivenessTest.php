@@ -216,6 +216,34 @@ final class RecoveryLivenessTest extends TestCase
         $this->builder()->build($workflow);
     }
 
+    #[Test]
+    public function a_recovery_wait_behind_a_loop_back_to_the_target_is_still_reached(): void
+    {
+        // the walk from `recover` pushes `later`, then `loop`; `loop` expires back to the target, so it
+        // comes off the stack a second time while `later` still sits under it. Stopping the walk there
+        // would leave `later` outside the recovery and its missing deadline unseen.
+        $workflow = new #[Workflow(name: 'recovery', globalTimeout: 60, onGlobalTimeout: 'recover')]
+        #[Start(state: 'await')]
+        #[State(key: 'await', type: 'wait')]
+        #[State(key: 'done', type: 'final')]
+        #[WaitFor(state: 'await', events: SampleEvent::class)]
+        #[On(from: 'await', trigger: 'event', to: 'done')]
+        #[State(key: 'recover', type: 'wait')]
+        #[WaitFor(state: 'recover', events: SampleEvent::class, deadlineSeconds: 30, onDeadline: 'loop')]
+        #[On(from: 'recover', trigger: 'event', to: 'later')]
+        #[State(key: 'loop', type: 'wait')]
+        #[WaitFor(state: 'loop', events: SampleEvent::class, deadlineSeconds: 30, onDeadline: 'recover')]
+        #[On(from: 'loop', trigger: 'event', to: 'done')]
+        #[State(key: 'later', type: 'wait')]
+        #[WaitFor(state: 'later', events: SampleEvent::class)]
+        #[On(from: 'later', trigger: 'event', to: 'done')]
+        class {};
+
+        $this->expectException(InvalidWorkflowDefinition::class);
+        $this->expectExceptionMessageMatches('/"later".*globalTimeout.*already consumed.*deadlineSeconds/');
+        $this->builder()->build($workflow);
+    }
+
     private function builder(): WorkflowBuilder
     {
         return new WorkflowBuilder(new ArrayContainer([

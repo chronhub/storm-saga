@@ -82,13 +82,16 @@ final readonly class TopologyRules
             if (! $spawn->indexed) {
                 continue;
             }
-            foreach ($spawns as $other) {
-                // `preg_quote` is a no-op on every slot that reaches here, the grammar checked at the
-                // top of this method admitting `[A-Za-z0-9_-]` alone. It stays because the quoting,
-                // not the grammar, is what makes this line correct on its own terms.
-                if ($other->slot !== $spawn->slot && preg_match('/^'.preg_quote($spawn->slot, '/').'-\d/', $other->slot) === 1) {
-                    throw InvalidWorkflowDefinition::spawnSlotShadowsAFamilyMember($other->slot, $spawn->slot, $workflow);
-                }
+            // `preg_quote` is a no-op on every slot that reaches here, the grammar checked at the
+            // top of this method admitting `[A-Za-z0-9_-]` alone. It stays because the quoting,
+            // not the grammar, is what makes this line correct on its own terms.
+            $shadowing = array_find(
+                $spawns,
+                static fn (Spawns $other): bool => $other->slot !== $spawn->slot
+                    && preg_match('/^'.preg_quote($spawn->slot, '/').'-\d/', $other->slot) === 1,
+            );
+            if ($shadowing !== null) {
+                throw InvalidWorkflowDefinition::spawnSlotShadowsAFamilyMember($shadowing->slot, $spawn->slot, $workflow);
             }
         }
     }

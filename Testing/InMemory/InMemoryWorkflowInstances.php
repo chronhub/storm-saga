@@ -61,13 +61,7 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
 
     public function findByCorrelation(string $correlationId): ?WorkflowInstanceRow
     {
-        foreach ($this->state->instances as $entry) {
-            if ($entry['row']->correlationId === $correlationId) {
-                return $entry['row'];
-            }
-        }
-
-        return null;
+        return array_find($this->state->instances, static fn (array $entry): bool => $entry['row']->correlationId === $correlationId)['row'] ?? null;
     }
 
     public function create(WorkflowInstanceRow $row, CorrelationReuse $reuse = CorrelationReuse::Reject): int
@@ -85,12 +79,9 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
         }
 
         $claims = $this->state->correlations[$row->correlationId] ?? [];
-        if ($reuse === CorrelationReuse::Reject) {
-            foreach ($claims as $claim) {
-                if ($claim['reuse'] === CorrelationReuse::Reject->value) {
-                    throw CorrelationAlreadyConsumed::by($row->workflowType, $row->correlationId);
-                }
-            }
+        if ($reuse === CorrelationReuse::Reject
+            && array_any($claims, static fn (array $claim): bool => $claim['reuse'] === CorrelationReuse::Reject->value)) {
+            throw CorrelationAlreadyConsumed::by($row->workflowType, $row->correlationId);
         }
 
         self::guardStateSize($row);
@@ -171,12 +162,12 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
         $now = $this->clock->now();
         $cutoff = ($quietForSeconds > 0 ? $now->subSeconds($quietForSeconds) : $now)->toString();
         // @infection-ignore-all; equivalent: usort below reindexes, the values wrap only tidies the interim shape
-        $quiet = array_values(array_filter(
+        $quiet = array_filter(
             $this->state->instances,
             static fn (array $entry): bool => $entry['row']->status === WorkflowStatus::Running
                 && $entry['row']->waivedAt instanceof PointInTime
                 && $entry['updatedAt'] < $cutoff,
-        ));
+        ) |> array_values(...);
         // @infection-ignore-all; equivalent: the filter above admits only rows whose waivedAt is an instant, the nullsafe form serves the analyser on the closure boundary
         usort($quiet, static fn (array $a, array $b): int => strcmp((string) $a['row']->waivedAt?->toString(), (string) $b['row']->waivedAt?->toString()));
 
@@ -203,10 +194,10 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
 
     public function livingChildren(string $parentCorrelationId): array
     {
-        return array_values(array_filter(
+        return array_filter(
             $this->childrenOf($parentCorrelationId),
             static fn (WorkflowInstanceRow $row): bool => $row->status === WorkflowStatus::Running,
-        ));
+        ) |> array_values(...);
     }
 
     public function pauseInstance(WorkflowId $id, ?string $reason): bool
@@ -286,26 +277,19 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
 
     public function spawnedMembers(string $parentCorrelationId, string $family): int
     {
-        $spawned = 0;
-        foreach (array_keys($this->state->correlations) as $correlationId) {
-            if (self::isMember((string) $correlationId, $parentCorrelationId, $family)) {
-                $spawned++;
-            }
-        }
-
-        return $spawned;
+        return array_filter(
+            $this->state->correlations,
+            static fn (int|string $correlationId): bool => self::isMember((string) $correlationId, $parentCorrelationId, $family),
+            ARRAY_FILTER_USE_KEY,
+        ) |> count(...);
     }
 
     public function livingMembers(string $parentCorrelationId, string $family): int
     {
-        $living = 0;
-        foreach ($this->state->instances as $entry) {
-            if ($entry['row']->status === WorkflowStatus::Running && self::isMember($entry['row']->correlationId, $parentCorrelationId, $family)) {
-                $living++;
-            }
-        }
-
-        return $living;
+        return array_filter(
+            $this->state->instances,
+            static fn (array $entry): bool => $entry['row']->status === WorkflowStatus::Running && self::isMember($entry['row']->correlationId, $parentCorrelationId, $family),
+        ) |> count(...);
     }
 
     public function loadAdoptableParent(string $correlationId): ?WorkflowInstanceRow
@@ -319,14 +303,9 @@ final readonly class InMemoryWorkflowInstances implements WorkflowInstanceStore
      */
     private function childrenOf(string $parentCorrelationId): array
     {
-        $children = [];
-        foreach ($this->state->instances as $entry) {
-            if ($entry['row']->parentRef()?->correlationId === $parentCorrelationId) {
-                $children[] = $entry['row'];
-            }
-        }
+        $children = array_filter($this->state->instances, static fn (array $entry): bool => $entry['row']->parentRef()?->correlationId === $parentCorrelationId);
 
-        return $children;
+        return array_map(static fn (array $entry): WorkflowInstanceRow => $entry['row'], $children) |> array_values(...);
     }
 
     /**

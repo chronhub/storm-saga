@@ -7,10 +7,10 @@ namespace Storm\Saga\Engine\Outcome;
 use Storm\Saga\Engine\Plan\SkipReason;
 
 /**
- * The step did nothing: the policy skipped, with its reason, or the machine ran and matched
- * nothing, where `$reason === null` marks an unmoved advance. The engine reports a plain false
- * either way; the reason exists for tests, with one exception the executor gives a voice: a
- * refused cancel is announced as `SagaCancelRefused`.
+ * The step did nothing. A reason distinguishes a policy skip or an absorbed join outcome
+ * from an unconsumed advance, where `$reason === null` lets the executor judge whether delivery
+ * can still succeed later. The public bool remains false; a refused cancel is announced as
+ * `SagaCancelRefused`.
  */
 final readonly class Nothing implements StepOutcome
 {

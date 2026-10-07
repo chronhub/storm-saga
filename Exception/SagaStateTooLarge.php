@@ -21,6 +21,13 @@ use Storm\Saga\Store\WorkflowInstanceRow;
  */
 final class SagaStateTooLarge extends RuntimeException implements SagaException
 {
+    /** Factory-attributed identity; null for an exception constructed without storage context. */
+    public private(set) ?string $workflowType = null;
+
+    public private(set) ?string $correlationId = null;
+
+    public private(set) ?int $limitBytes = null;
+
     /**
      * @param  array<string, int>  $sizes  encoded byte size per bag, so the message names the culprit
      *                                     instead of the total
@@ -28,12 +35,13 @@ final class SagaStateTooLarge extends RuntimeException implements SagaException
     public static function forInstance(string $workflowType, string $correlationId, int $total, int $max, array $sizes): self
     {
         arsort($sizes);
-        $breakdown = [];
-        foreach ($sizes as $bag => $bytes) {
-            $breakdown[] = sprintf('%s=%d', $bag, $bytes);
-        }
+        $breakdown = array_map(
+            static fn (string $bag, int $bytes): string => sprintf('%s=%d', $bag, $bytes),
+            array_keys($sizes),
+            $sizes,
+        );
 
-        return new self(sprintf(
+        $error = new self(sprintf(
             'Saga "%s/%s" carries %d bytes of state, over the %d-byte cap (%s). A saga state holds ids,'
             .' amounts and flags — a bag this size is being appended to on every step, and since one'
             .' update rewrites all of them, every transition pays for it again. Keep the growing data'
@@ -44,5 +52,10 @@ final class SagaStateTooLarge extends RuntimeException implements SagaException
             $max,
             implode(', ', $breakdown),
         ));
+        $error->workflowType = $workflowType;
+        $error->correlationId = $correlationId;
+        $error->limitBytes = $max;
+
+        return $error;
     }
 }

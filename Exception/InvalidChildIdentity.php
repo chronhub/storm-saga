@@ -7,6 +7,7 @@ namespace Storm\Saga\Exception;
 use RuntimeException;
 use Storm\Saga\Child\ChildCorrelation;
 use Storm\Saga\Child\ParentRef;
+use Storm\Support\Text\Str;
 
 /**
  * The child-identity gate refused a birth. The delimiter of {@see ChildCorrelation} is a reserved
@@ -23,7 +24,7 @@ final class InvalidChildIdentity extends RuntimeException implements SagaExcepti
     {
         return new self(sprintf(
             'Correlation "%s" lies in the child namespace — the delimiter is reserved; a child is born through a spawn declaring its parent, never through a native start.',
-            self::printable($correlationId),
+            Str::printable($correlationId),
         ));
     }
 
@@ -31,8 +32,8 @@ final class InvalidChildIdentity extends RuntimeException implements SagaExcepti
     {
         return new self(sprintf(
             'A start declaring a parent must carry the minted child correlation "%s", got "%s" — the deterministic identity is the idempotence guard, it cannot be free-formed.',
-            self::printable($expected),
-            self::printable($actual),
+            Str::printable($expected),
+            Str::printable($actual),
         ));
     }
 
@@ -40,24 +41,12 @@ final class InvalidChildIdentity extends RuntimeException implements SagaExcepti
     {
         return new self(sprintf(
             'Child slot "%s" is invalid — a slot is a static identifier, 1 to 64 characters of [A-Za-z0-9_-].',
-            self::printable($slot),
+            Str::printable($slot),
         ));
     }
 
     public static function malformedParentContext(string $reason): self
     {
         return new self(sprintf('Malformed "%s" context: %s', ParentRef::CONTEXT_KEY, $reason));
-    }
-
-    /**
-     * Escapes the reserved delimiter and every other C0 control so the message stays log-safe.
-     */
-    private static function printable(string $value): string
-    {
-        return (string) preg_replace_callback(
-            '/[\x00-\x1f\x7f]/',
-            static fn (array $match): string => sprintf('\x%02X', ord($match[0])),
-            $value,
-        );
     }
 }

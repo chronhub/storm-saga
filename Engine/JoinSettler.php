@@ -8,6 +8,7 @@ use Storm\Clock\PointInTime;
 use Storm\Contracts\Clock\Clock;
 use Storm\Contracts\Clock\ClockExceptionContract;
 use Storm\Saga\Attributes\JoinArm;
+use Storm\Saga\Engine\Plan\SkipReason;
 use Storm\Saga\Engine\Run\Rested;
 use Storm\Saga\Engine\Run\Unmoved;
 use Storm\Saga\Engine\State\WaitVarExtractor;
@@ -18,6 +19,7 @@ use Storm\Saga\Event\SagaJoinCompleted;
 use Storm\Saga\Event\SagaJoinFailed;
 use Storm\Saga\Exception\MissingExtractField;
 use Storm\Saga\Exception\SagaStorageFailure;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\WorkflowOutbox;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Workflow\ActivityOutcome;
@@ -48,9 +50,9 @@ use Throwable;
  * marks its arm and logs it confirmed like every arrival before it. A definitive arm failure, out
  * through the failure event's own `#[On(onEvent:)]` edge, disposes of the WHOLE join in the same
  * step, each arm by what its evidence allows: an arm already completed is compensated through ITS
- * `compensate` and its confirmed entry settles; a command still pending in the outbox is RECALLED,
- * the proven non-event; one in flight with no outcome yet is compensated on the spot, the
- * undo-before-do clause every arm signed. A failed undo is flagged `CompensationFailed` and left
+ * `compensate` and its confirmed entry settles; a command no relay ever claimed is RECALLED, the
+ * proven non-event; one claimed with no outcome yet is compensated on the spot, the undo-before-do
+ * clause every arm signed. A failed undo is flagged `CompensationFailed` and left
  * `Failed` for reconciliation, never silently retried.
  *
  * @see JoinArm
@@ -70,7 +72,8 @@ final readonly class JoinSettler
     /**
      * Judge a delivered event against the join whose wait the row rests on, BEFORE the machine
      * runs: a partial completion comes back `Rested` in place, a duplicate or contradictory arrival
-     * comes back `Unmoved`, and null hands the stimulus to the machine: no join here, the last
+     * comes back `Unmoved`, mapped by the performer to `SkipReason::JoinArmAlreadyArrived` so
+     * routing absorbs it without retry. Null hands the stimulus to the machine: no join here, the last
      * completion, a first failure, or an event the wait's own matcher would refuse.
      *
      * @throws ClockExceptionContract when the arrival timestamp cannot be derived
@@ -84,6 +87,8 @@ final readonly class JoinSettler
         }
 
         [$joinState, $join] = $this->joinedAt($def, $row->stateKey) ?? [null, null];
+        // `joinedAt()` answers both halves or neither, so `&&` for `||` is an equivalent mutant; the
+        // gate's configuration leaves out this method's only LogicalOr
         if ($joinState === null || $join === null) {
             return null;
         }
@@ -248,9 +253,10 @@ final readonly class JoinSettler
                 continue;
             }
 
-            if ($this->outbox->cancelPending($origin->id(), $arm->name) > 0) {
-                // never claimed by the relay: the row-lock arbitration proves nothing was dispatched,
-                // so there is nothing to undo; the one sibling whose non-event is PROVEN
+            if ($this->outbox->recallUndispatched($origin->id(), $origin->generation, $joinState->key, $arm->name) > 0) {
+                // never claimed by any relay: the NULL marker, read once a claim still committing
+                // is waited out, proves nothing was dispatched, so there is nothing to undo; the
+                // one sibling whose non-event is PROVEN
                 $log = [...$log, CompensationRecord::forArm($joinState->key, $arm->name, CompensationStatus::Skipped, confirmed: false, reason: 'recalled: never dispatched', at: $now)];
                 $recalled[] = $arm->name;
 
@@ -287,7 +293,7 @@ final readonly class JoinSettler
         try {
             $outcome = $arm->compensation->run($vars, $metadata);
             if ($outcome->outcome === ActivityOutcome::Success) {
-                $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, $arm->name), $outcome->commands)];
+                $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, CommandPurpose::Compensation, $arm->name), $outcome->commands)];
 
                 return [$this->settleEntry($log, $stateKey.'#'.$arm->name, CompensationStatus::Compensated, null, $now), $outcome->vars, $commands, $events, true];
             }
@@ -317,7 +323,7 @@ final readonly class JoinSettler
         try {
             $outcome = $arm->compensation->run($vars, $metadata);
             if ($outcome->outcome === ActivityOutcome::Success) {
-                $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, $arm->name), $outcome->commands)];
+                $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, CommandPurpose::Compensation, $arm->name), $outcome->commands)];
                 $log = [...$log, CompensationRecord::forArm($stateKey, $arm->name, CompensationStatus::Compensated, confirmed: false, at: $now)];
 
                 return [$log, $outcome->vars, $commands, $events, true];

@@ -52,6 +52,8 @@ final readonly class Retry
         public array $doNotRetryOn = [],
         public ?int $maxElapsedSeconds = null,
         public ?int $maxRequestedDelaySeconds = null,
+        /** Maximum policy delay including jitter; requested delays have a separate grant. */
+        public int $maxBackoffMs = 60_000,
     ) {
         $this->strategy = is_string($strategy) ? BackoffStrategy::from($strategy) : $strategy;
     }

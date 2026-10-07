@@ -128,10 +128,10 @@ final class SemaphoreLedger
         }
 
         $queue = $this->queue();
-        foreach ($queue as $index => $entry) {
-            if ($entry['token'] === $token) {
-                return new Queued($index + 1);
-            }
+        $index = array_find_key($queue, static fn (array $entry): bool => $entry['token'] === $token);
+
+        if ($index !== null) {
+            return new Queued($index + 1);
         }
 
         $ttl = $grantTtlSeconds ?? $this->intVar(self::GRANT_TTL);
@@ -183,10 +183,8 @@ final class SemaphoreLedger
         // other. Neither is individually observable; both stay, the list shape being an invariant of
         // the stored vars rather than of one write path.
         // @infection-ignore-all; equivalent: the array_values twin argued just above
-        $this->vars[self::QUEUE] = array_values(array_filter(
-            $this->queue(),
-            static fn (array $entry): bool => $entry['token'] !== $token,
-        ));
+        $this->vars[self::QUEUE] = array_filter($this->queue(), static fn (array $entry): bool => $entry['token'] !== $token)
+            |> array_values(...);
 
         $this->promote();
     }
@@ -238,31 +236,25 @@ final class SemaphoreLedger
      */
     private function reap(): void
     {
-        $holders = [];
-        $expropriated = $this->intVar(self::EXPROPRIATED);
-        foreach ($this->holders() as $token => $grant) {
-            if (PointInTime::fromStorage((string) $grant['expires_at'])->isAfter($this->now)) {
-                $holders[$token] = $grant;
-            } else {
-                $expropriated++;
-            }
-        }
-        $this->vars[self::HOLDERS] = $holders;
-        $this->vars[self::EXPROPRIATED] = $expropriated;
+        $holders = $this->holders();
+        $living = array_filter($holders, $this->isAlive(...));
+        $this->vars[self::HOLDERS] = $living;
+        $this->vars[self::EXPROPRIATED] = $this->intVar(self::EXPROPRIATED) + count($holders) - count($living);
 
-        $queue = [];
-        $lapsed = $this->intVar(self::LAPSED);
-        foreach ($this->queue() as $entry) {
-            if (PointInTime::fromStorage((string) $entry['expires_at'])->isAfter($this->now)) {
-                $queue[] = $entry;
-            } else {
-                $lapsed++;
-            }
-        }
-        $this->vars[self::QUEUE] = $queue;
-        $this->vars[self::LAPSED] = $lapsed;
+        $queue = $this->queue();
+        $waiting = array_filter($queue, $this->isAlive(...)) |> array_values(...);
+        $this->vars[self::QUEUE] = $waiting;
+        $this->vars[self::LAPSED] = $this->intVar(self::LAPSED) + count($queue) - count($waiting);
 
         $this->promote();
+    }
+
+    /**
+     * @param  mixed[]  $record
+     */
+    private function isAlive(array $record): bool
+    {
+        return PointInTime::fromStorage((string) $record['expires_at'])->isAfter($this->now);
     }
 
     /**
@@ -275,6 +267,9 @@ final class SemaphoreLedger
         $queue = $this->queue();
         $capacity = $this->intVar(self::CAPACITY);
 
+        // a mutant loosening or negating this guard spins on an empty queue: a test driving a
+        // promotion loops until it times out, and a test failing first kills it, so these mutants
+        // flap between killed and timed out by the order Infection runs the covering tests in
         while (count($holders) < $capacity && $queue !== []) {
             $entry = array_shift($queue);
             $expiresAt = $this->lease((int) $entry['grant_ttl']);

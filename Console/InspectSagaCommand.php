@@ -13,6 +13,7 @@ use Storm\Saga\Store\Inspection\SagaInspectionGateway;
 use Storm\Saga\Store\Inspection\SagaSnapshot;
 use Storm\Saga\Store\Inspection\TimerSnapshot;
 use Storm\Saga\Workflow\CompensationRecord;
+use Storm\Support\Text\Str;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
@@ -170,17 +171,19 @@ final class InspectSagaCommand extends Command
         if ($saga->retries !== []) {
             $io->newLine();
             $io->writeln(' <comment>retries</comment>');
-            foreach ($saga->retries as $state => $visit) {
-                // `since` answers the incident's time question, "how long has this state been
-                // retrying", which the bare count cannot; a legacy row without a window shows the
-                // count alone
-                $io->writeln(sprintf(
+            // `since` answers the incident's time question, "how long has this state been
+            // retrying", which the bare count cannot; a legacy row without a window shows the
+            // count alone
+            $io->writeln(array_map(
+                static fn (int|string $state, array $visit): string => sprintf(
                     '   %s ×%d%s',
                     $state,
                     $visit['n'],
                     $visit['since'] !== null ? sprintf(' since %s', $visit['since']) : '',
-                ));
-            }
+                ),
+                array_keys($saga->retries),
+                $saga->retries,
+            ));
         }
 
         $this->renderExposed($io, $saga->exposed);
@@ -227,8 +230,8 @@ final class InspectSagaCommand extends Command
         return match (true) {
             $value === null => '—',
             is_bool($value) => $value ? 'true' : 'false',
-            is_scalar($value) => self::truncate((string) $value),
-            default => self::truncate(json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: get_debug_type($value)),
+            is_scalar($value) => Str::excerpt(self::MAX_ERROR_LEN)((string) $value),
+            default => Str::excerpt(self::MAX_ERROR_LEN)(json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: get_debug_type($value)),
         };
     }
 
@@ -257,7 +260,7 @@ final class InspectSagaCommand extends Command
                 $c->confirmed ? 'yes' : '—',
                 $c->degraded ? 'yes' : '—',
                 $c->at ?? '—',
-                self::truncate($c->reason ?? ''),
+                Str::excerpt(self::MAX_ERROR_LEN)($c->reason ?? ''),
             ], $compensations),
         );
     }
@@ -308,27 +311,15 @@ final class InspectSagaCommand extends Command
                 ['status', 'command', 'issued by', 'evidence', 'bus', 'attempts', 'created at', 'error'],
                 array_map(static fn (OutboxSnapshot $o): array => [
                     $o->status,
-                    self::shortClass($o->command ?? '?'),
+                    Str::shortClass($o->command ?? '?'),
                     sprintf('%s@v%d/g%d', $o->issuedFromState === '' ? '—' : $o->issuedFromState, $o->issuedAtVersion, $o->generation),
                     $o->status === OutboxStatus::Failed->value ? $o->evidence->value : '—',
                     $o->bus,
                     (string) $o->attempts,
                     $o->createdAt,
-                    self::truncate($o->lastError ?? ''),
+                    Str::excerpt(self::MAX_ERROR_LEN)($o->lastError ?? ''),
                 ], $outbox),
             );
         }
-    }
-
-    private static function shortClass(string $fqcn): string
-    {
-        $pos = strrpos($fqcn, '\\');
-
-        return $pos === false ? $fqcn : substr($fqcn, $pos + 1);
-    }
-
-    private static function truncate(string $value): string
-    {
-        return mb_strlen($value) <= self::MAX_ERROR_LEN ? $value : mb_substr($value, 0, self::MAX_ERROR_LEN - 1).'…';
     }
 }

@@ -50,6 +50,7 @@ final readonly class DeclarationReader
                 $retry->doNotRetryOn,
                 $retry->maxElapsedSeconds,
                 $retry->maxRequestedDelaySeconds,
+                $retry->maxBackoffMs,
             );
         }
 

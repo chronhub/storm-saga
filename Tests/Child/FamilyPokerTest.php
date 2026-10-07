@@ -92,6 +92,11 @@ final class FamilyPokerTest extends TestCase
 
             public function __construct(private readonly bool $spends) {}
 
+            public function pokeFamilyOrThrow(string $workflowType, string $correlationId, ?string $causationId = null): bool
+            {
+                return $this->pokeFamily($workflowType, $correlationId, $causationId);
+            }
+
             public function pokeFamily(string $workflowType, string $correlationId, ?string $causationId = null): bool
             {
                 $this->poked[] = [$workflowType, $correlationId];

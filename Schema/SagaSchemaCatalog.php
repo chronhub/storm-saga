@@ -75,7 +75,7 @@ final class SagaSchemaCatalog
         'workflow_timers' => [
             'id' => 'bigint not null',
             'workflow_type' => 'text not null',
-            'correlation_id' => 'text not null',
+            'correlation_id' => 'text not null collate C',
             'state_key' => 'text not null',
             'kind' => 'text not null',
             'fire_at' => 'timestamp(6) with time zone not null',
@@ -88,7 +88,7 @@ final class SagaSchemaCatalog
         'workflow_outbox' => [
             'id' => 'bigint not null',
             'workflow_type' => 'text not null',
-            'correlation_id' => 'text not null',
+            'correlation_id' => 'text not null collate C',
             'bus' => 'text not null',
             'header' => 'jsonb not null',
             'content' => 'jsonb not null',
@@ -101,6 +101,8 @@ final class SagaSchemaCatalog
             'generation' => 'integer not null',
             'evidence' => 'text not null',
             'effect_group' => 'text null',
+            'purpose' => 'text not null',
+            'claimed_until' => 'timestamp(6) with time zone null',
             'created_at' => 'timestamp(6) with time zone not null',
             'processed_at' => 'timestamp(6) with time zone null',
         ],
@@ -116,6 +118,7 @@ final class SagaSchemaCatalog
             'issued_at_version' => 'integer not null',
             'generation' => 'integer not null',
             'evidence' => 'text not null',
+            'purpose' => 'text not null',
             'created_at' => 'timestamp(6) with time zone not null',
             'archived_at' => 'timestamp(6) with time zone not null',
         ],
@@ -128,8 +131,10 @@ final class SagaSchemaCatalog
     ];
 
     /**
-     * Named constraints per table; a non-null value is a fragment the live `pg_get_constraintdef`
-     * must contain, a name alone proving nothing about a pre-existing homonym. Every primary key
+     * Named constraints per table; a non-null value opening on its definition keyword is the
+     * complete definition the live `pg_get_constraintdef` must equal, and any other is a fragment it
+     * must contain, the rule `ConstraintShape` applies; a name alone proves nothing about a
+     * pre-existing homonym. Every primary key
      * pins its full column list, `PRIMARY KEY (…)` deparsing verbatim: `workflow_correlations_pk`
      * is the numbering backstop when two births race on the same correlation, and a homonym keyed
      * differently misroutes every upsert in silence. `workflow_timers_unique`, what makes re-arming
@@ -137,13 +142,15 @@ final class SagaSchemaCatalog
      * `circuit_breaker` declares its `PRIMARY KEY` inline with no name of ours, so only its checks
      * are verified here; its column shapes are still pinned above.
      *
-     * The `_chk` fragments are cut to what SURVIVES deparsing, which is rarely what the DDL reads:
+     * The `_chk` values follow what SURVIVES deparsing, which is rarely what the DDL reads: a value is
+     * the complete definition where the two renderings agree, and a fragment where they part:
      *
      * - A vocabulary written `IN (…)` comes back as `= ANY (ARRAY['x'::text, …])`, so the fragment
      *   is one quoted value, the one a narrowed homonym would drop first
      * - A negative floor comes back as `>= '-1'::integer`, so `issued_at_version` pins its column
      *   and its operator, never the bound
-     * - A non-negative floor deparses verbatim and is pinned whole
+     * - A non-negative floor is pinned as its complete definition, `CHECK ((generation >= 1))`,
+     *   which the deparse must equal
      *
      * @var array<string, array<string, string|null>>
      */
@@ -151,19 +158,19 @@ final class SagaSchemaCatalog
         'workflow_instances' => [
             'workflow_instances_pk' => 'PRIMARY KEY (workflow_type, correlation_id)',
             'workflow_instances_status_chk' => "'running'",
-            'workflow_instances_version_chk' => 'version >= 0',
-            'workflow_instances_generation_chk' => 'generation >= 1',
-            'workflow_instances_definition_version_chk' => 'definition_version >= 1',
-            'workflow_instances_state_version_chk' => 'state_version >= 1',
-            'workflow_instances_retry_total_chk' => 'retry_total >= 0',
-            'workflow_instances_retimes_chk' => 'retimes >= 0',
+            'workflow_instances_version_chk' => 'CHECK ((version >= 0))',
+            'workflow_instances_generation_chk' => 'CHECK ((generation >= 1))',
+            'workflow_instances_definition_version_chk' => 'CHECK ((definition_version >= 1))',
+            'workflow_instances_state_version_chk' => 'CHECK ((state_version >= 1))',
+            'workflow_instances_retry_total_chk' => 'CHECK ((retry_total >= 0))',
+            'workflow_instances_retimes_chk' => 'CHECK ((retimes >= 0))',
         ],
         'workflow_pauses' => ['workflow_pauses_pk' => 'PRIMARY KEY (workflow_type)'],
         'workflow_correlations' => [
             'workflow_correlations_pk' => 'PRIMARY KEY (correlation_id, generation)',
             'workflow_correlations_reuse_chk' => "'reject'",
-            'workflow_correlations_generation_chk' => 'generation >= 1',
-            'workflow_correlations_definition_version_chk' => 'definition_version >= 1',
+            'workflow_correlations_generation_chk' => 'CHECK ((generation >= 1))',
+            'workflow_correlations_definition_version_chk' => 'CHECK ((definition_version >= 1))',
             'workflow_correlations_final_status_chk' => "'compensated'",
             'workflow_correlations_closure_chk' => '(closed_at IS NULL) = (final_status IS NULL',
         ],
@@ -171,26 +178,28 @@ final class SagaSchemaCatalog
             'workflow_timers_pk' => 'PRIMARY KEY (id)',
             'workflow_timers_unique' => null,
             'workflow_timers_kind_chk' => "'timeout'",
-            'workflow_timers_attempts_chk' => 'attempts >= 0',
+            'workflow_timers_attempts_chk' => 'CHECK ((attempts >= 0))',
         ],
         'workflow_outbox' => [
             'workflow_outbox_pk' => 'PRIMARY KEY (id)',
             'workflow_outbox_status_chk' => "'pending'",
             'workflow_outbox_evidence_chk' => "'uncommitted'",
-            'workflow_outbox_attempts_chk' => 'attempts >= 0',
-            'workflow_outbox_generation_chk' => 'generation >= 1',
+            'workflow_outbox_purpose_chk' => "'compensation'",
+            'workflow_outbox_attempts_chk' => 'CHECK ((attempts >= 0))',
+            'workflow_outbox_generation_chk' => 'CHECK ((generation >= 1))',
             'workflow_outbox_issued_at_version_chk' => 'issued_at_version >=',
         ],
         'workflow_outbox_archive' => [
             'workflow_outbox_archive_pk' => 'PRIMARY KEY (id)',
             'workflow_outbox_archive_evidence_chk' => "'uncommitted'",
-            'workflow_outbox_archive_attempts_chk' => 'attempts >= 0',
-            'workflow_outbox_archive_generation_chk' => 'generation >= 1',
+            'workflow_outbox_archive_purpose_chk' => "'compensation'",
+            'workflow_outbox_archive_attempts_chk' => 'CHECK ((attempts >= 0))',
+            'workflow_outbox_archive_generation_chk' => 'CHECK ((generation >= 1))',
             'workflow_outbox_archive_issued_at_version_chk' => 'issued_at_version >=',
         ],
         'circuit_breaker' => [
             'circuit_breaker_state_chk' => "'open'",
-            'circuit_breaker_failures_chk' => 'failures >= 0',
+            'circuit_breaker_failures_chk' => 'CHECK ((failures >= 0))',
         ],
     ];
 

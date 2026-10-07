@@ -134,6 +134,7 @@ final readonly class StepExecutor
 
             $def = $this->loader->resolve($registry, $id->workflowType, $row); // pin: latest at birth, the row's version on advance
             $row = $this->loader->migrated($def, $row); // forward when lawful, refused when not; in memory, persisted by the step's write
+            $signal = $this->loader->withProvenance($signal, $row); // an effect failure pairs against this run, never a pre-fence read
             $plan = $this->policy->plan($signal, $row, $def, $now);
             $outcome = $this->performer->perform($plan, $def, $id, $row, $now, $signal->causationId);
 

@@ -50,8 +50,6 @@ final class AttributePriorityResolver implements PriorityResolver
      */
     private function readLevel(string $class): ?int
     {
-        $attributes = new ReflectionClass($class)->getAttributes(Prioritized::class);
-
-        return $attributes === [] ? null : $attributes[0]->newInstance()->level;
+        return array_first(new ReflectionClass($class)->getAttributes(Prioritized::class))?->newInstance()->level;
     }
 }

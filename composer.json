@@ -20,8 +20,8 @@
         "symfony/dependency-injection": "^8.1"
     },
     "require-dev": {
-        "phpstan/phpstan": "^2.2.8",
-        "phpunit/phpunit": "^13.3.0"
+        "phpstan/phpstan": "^2.2.16",
+        "phpunit/phpunit": "^13.4.0"
     },
     "suggest": {
         "phpunit/phpunit": "The in-memory runtime assertions (Testing/InMemory) call PHPUnit's Assert — already present wherever the kit runs, inside a test suite."

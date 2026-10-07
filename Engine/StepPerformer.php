@@ -32,7 +32,9 @@ use Storm\Saga\Event\SagaStarted;
 use Storm\Saga\Exception\MissingAsyncTimeout;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
@@ -54,6 +56,7 @@ final readonly class StepPerformer
     public function __construct(
         private MachineRunner $machine,
         private Compensator $compensator,
+        private RecallJudge $recalls,
         private WaitEscalator $escalator,
         private DeadlineEnforcer $enforcer,
         private FailedEffectSettler $settler,
@@ -68,7 +71,9 @@ final readonly class StepPerformer
      *
      * @throws WorkflowStepLimitExceeded when a synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
+     * @throws SagaStorageFailure when a recall, a settle or a family's member counts cannot reach storage; the step rolls back whole
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      * @throws Throwable when the machine throws an exception, re-thrown
      */
@@ -113,7 +118,7 @@ final readonly class StepPerformer
         $result = $handler($plan->signal, $row->vars);
 
         $resting = $row->restingAt($row->stateKey, $row->status, $result->vars, $row->retries, $row->compensations);
-        $commands = array_map(static fn (object $c): IssuedCommand => new IssuedCommand($row->stateKey, $c), $result->commands);
+        $commands = array_map(static fn (object $c): IssuedCommand => new IssuedCommand($row->stateKey, $c, CommandPurpose::Forward), $result->commands);
 
         if ($result->retime === null) {
             return new Updated($resting, [], $commands, signalReply: $result->result);
@@ -178,7 +183,9 @@ final readonly class StepPerformer
      *
      * @throws WorkflowStepLimitExceeded when the start's synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
+     * @throws SagaStorageFailure when the rollback's recall cannot be read and locked; the step rolls back whole
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      * @throws Throwable when the start throws an exception, re-thrown
      */
@@ -209,7 +216,7 @@ final readonly class StepPerformer
         $announcements = [$started];
 
         if ($run instanceof Rested) {
-            $run = $this->compensator->maybeCompensate($def, $run, $causationId);
+            $run = $this->rolledBack($def, $run, $causationId);
             $resting = $run->row;
             $ops = $run->timerOps;
             $commands = $run->commands;
@@ -228,7 +235,9 @@ final readonly class StepPerformer
      *
      * @throws WorkflowStepLimitExceeded when the synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
+     * @throws SagaStorageFailure when a recall, a settle or a family's member counts cannot reach storage; the step rolls back whole
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      * @throws Throwable when the machine throws an exception, re-thrown
      */
@@ -245,7 +254,7 @@ final readonly class StepPerformer
             return $this->updated($gate); // nothing crossed, so no compensation pass to take
         }
         if ($gate instanceof Unmoved) {
-            return new Nothing;
+            return new Nothing(SkipReason::JoinArmAlreadyArrived);
         }
 
         // a conclusion landing on an indexed family's awaited wait must not cross while members
@@ -268,7 +277,7 @@ final readonly class StepPerformer
         // the ledger confirmed, a definitive arm failure disposes of the whole join
         $run = $this->joins->settle($def, $row, $stimulus, $run, $causationId);
 
-        return $this->updated($this->compensator->maybeCompensate($def, $run, $causationId)); // halt-with-rollback, so compensate
+        return $this->updated($this->rolledBack($def, $run, $causationId)); // halt-with-rollback, so compensate
     }
 
     /**
@@ -291,6 +300,7 @@ final readonly class StepPerformer
      *
      * @throws WorkflowStepLimitExceeded when the synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      * @throws SagaStorageFailure when the member counts cannot be read; the step rolls back whole
@@ -323,7 +333,18 @@ final readonly class StepPerformer
             $run->commands,
         );
 
-        return $this->updated($this->compensator->maybeCompensate($def, $run, $cause));
+        return $this->updated($this->rolledBack($def, $run, $cause));
+    }
+
+    /**
+     * The halt-with-rollback of a rested run, its recall judged first.
+     *
+     * @throws SagaStorageFailure when the recall's rows cannot be read and locked; the step rolls back whole
+     * @throws ClockExceptionContract when a compensation timestamp cannot be derived
+     */
+    private function rolledBack(WorkflowDefinition $def, Rested $run, ?string $causationId): Rested
+    {
+        return $this->compensator->maybeCompensate($def, $run, $causationId, $this->recalls->judge($run));
     }
 
     private function updated(Rested $run): Updated

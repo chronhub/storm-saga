@@ -17,6 +17,6 @@ enum BreakerState: string
     /** Tripped; calls fast-fail without touching the protected resource until the cooldown elapses. */
     case Open = 'open';
 
-    /** Cooldown elapsed; a single probe is admitted, whose outcome closes or re-opens the breaker. */
+    /** Cooldown elapsed; probes pass racily, not one at a time, and their outcome closes or re-opens the breaker. */
     case HalfOpen = 'half_open';
 }

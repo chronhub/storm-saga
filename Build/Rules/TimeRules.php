@@ -102,10 +102,9 @@ final readonly class TimeRules
      */
     public function onDeadlineTargetsAKnownState(string $workflow, array $waits, array $types): void
     {
-        foreach ($waits as $wait) {
-            if ($wait->onDeadline !== null && ! isset($types[$wait->onDeadline])) {
-                throw InvalidWorkflowDefinition::onDeadlineUnknownState($wait->onDeadline, $wait->state, $workflow);
-            }
+        $wait = array_find($waits, static fn (WaitFor $wait): bool => $wait->onDeadline !== null && ! isset($types[$wait->onDeadline]));
+        if ($wait?->onDeadline !== null) {
+            throw InvalidWorkflowDefinition::onDeadlineUnknownState($wait->onDeadline, $wait->state, $workflow);
         }
     }
 
@@ -119,10 +118,9 @@ final readonly class TimeRules
      */
     public function scheduleForTargetsScheduleStates(string $workflow, array $scheduleKeys, array $types): void
     {
-        foreach ($scheduleKeys as $stateKey) {
-            if (($types[$stateKey] ?? null) !== StateType::Schedule) {
-                throw InvalidWorkflowDefinition::scheduleOnNonScheduleState($stateKey, $workflow);
-            }
+        $stateKey = array_find($scheduleKeys, static fn (string $stateKey): bool => ($types[$stateKey] ?? null) !== StateType::Schedule);
+        if ($stateKey !== null) {
+            throw InvalidWorkflowDefinition::scheduleOnNonScheduleState($stateKey, $workflow);
         }
     }
 
@@ -141,10 +139,8 @@ final readonly class TimeRules
             return;
         }
 
-        foreach ($types as $type) {
-            if ($type === StateType::Schedule) {
-                throw InvalidWorkflowDefinition::globalTimeoutOnScheduleWorkflow($workflow);
-            }
+        if (in_array(StateType::Schedule, $types, true)) {
+            throw InvalidWorkflowDefinition::globalTimeoutOnScheduleWorkflow($workflow);
         }
     }
 
@@ -283,12 +279,23 @@ final readonly class TimeRules
             if ($policy->baseMs < 1) {
                 throw InvalidWorkflowDefinition::retryBaseDelayNotPositive((string) $stateKey, $policy->baseMs, $workflow);
             }
+            if ($policy->maxBackoffMs < 1) {
+                throw InvalidWorkflowDefinition::durationNotPositive('#[Retry] maxBackoffMs', $policy->maxBackoffMs, (string) $stateKey, $workflow);
+            }
+            // the lists come from attribute arguments no runtime check types, and the blank check
+            // below reads them in coercive mode, where an integer would pass as a numeric string
             foreach (['retryOn' => $policy->retryOn, 'doNotRetryOn' => $policy->doNotRetryOn] as $list => $patterns) {
-                foreach ($patterns as $pattern) {
-                    if (trim($pattern) === '') {
-                        throw InvalidWorkflowDefinition::retryPatternBlank((string) $stateKey, $list, $workflow);
-                    }
+                $foreign = array_find_key($patterns, static fn (mixed $pattern): bool => ! is_string($pattern)); // @phpstan-ignore function.alreadyNarrowedType
+                if ($foreign !== null) {
+                    throw InvalidWorkflowDefinition::retryPatternNotString((string) $stateKey, $list, get_debug_type($patterns[$foreign]), $workflow);
                 }
+            }
+            $blankList = array_find_key(
+                ['retryOn' => $policy->retryOn, 'doNotRetryOn' => $policy->doNotRetryOn],
+                static fn (array $patterns): bool => array_any($patterns, static fn (string $pattern): bool => trim($pattern) === ''),
+            );
+            if ($blankList !== null) {
+                throw InvalidWorkflowDefinition::retryPatternBlank((string) $stateKey, $blankList, $workflow);
             }
             if ($policy->maxElapsedSeconds !== null && $policy->maxElapsedSeconds < 1) {
                 throw InvalidWorkflowDefinition::durationNotPositive('#[Retry] maxElapsedSeconds', $policy->maxElapsedSeconds, (string) $stateKey, $workflow);
@@ -321,10 +328,9 @@ final readonly class TimeRules
      */
     public function retimablesTargetWaitStates(string $workflow, array $retimableKeys, array $types): void
     {
-        foreach ($retimableKeys as $stateKey) {
-            if (($types[$stateKey] ?? null) !== StateType::Wait) {
-                throw InvalidWorkflowDefinition::retimableOnNonWaitState($stateKey, $workflow);
-            }
+        $stateKey = array_find($retimableKeys, static fn (string $stateKey): bool => ($types[$stateKey] ?? null) !== StateType::Wait);
+        if ($stateKey !== null) {
+            throw InvalidWorkflowDefinition::retimableOnNonWaitState($stateKey, $workflow);
         }
     }
 
@@ -356,7 +362,7 @@ final readonly class TimeRules
      * Reject a per-state `timeoutSeconds` at or above the workflow `globalTimeout`: the per-state timer
      * cannot achieve its purpose of acting before the global takes over. At `>` it never fires, since the
      * global preempts; at `=` the two race in the runner with non-deterministic ordering. Either way, the
-     * per-state transition is silently dead-coded, so reject at build. With any global timeout, there is no
+     * per-state transition is silently dead-coded, so reject at build. Without a global timeout, there is no
      * constraint.
      *
      * @param  array<string, State>  $states
@@ -423,14 +429,16 @@ final readonly class TimeRules
      */
     public function heartbeatWaitsMustGate(string $workflow, array $states): void
     {
-        foreach ($states as $state) {
-            if (! $state instanceof WaitState || $state->timeout === null || $this->hasTimeoutEdge($state)) {
-                continue; // not a timed wait, or a deadline that carries its finalized edge
-            }
-
-            if (! EffectGating::gates($states, $state->key)) {
-                throw InvalidWorkflowDefinition::heartbeatOnNonGatingWait($state->key, $workflow);
-            }
+        // a timed wait with no finalized edge; a deadline carrying its edge is judged by the gating guard
+        $ungated = array_find(
+            $states,
+            fn (State $state): bool => $state instanceof WaitState
+                && $state->timeout !== null
+                && ! $this->hasTimeoutEdge($state)
+                && ! EffectGating::gates($states, $state->key),
+        );
+        if ($ungated !== null) {
+            throw InvalidWorkflowDefinition::heartbeatOnNonGatingWait($ungated->key, $workflow);
         }
     }
 
@@ -447,11 +455,13 @@ final readonly class TimeRules
      */
     public function retriableRequiresHeartbeat(string $workflow, array $states): void
     {
-        foreach ($states as $state) {
-            if ($state instanceof WaitState && $state->retriable
-                && ($state->timeout === null || $this->hasTimeoutEdge($state))) {
-                throw InvalidWorkflowDefinition::retriableWaitWithoutHeartbeat($state->key, $workflow);
-            }
+        $retriable = array_find(
+            $states,
+            fn (State $state): bool => $state instanceof WaitState && $state->retriable
+                && ($state->timeout === null || $this->hasTimeoutEdge($state)),
+        );
+        if ($retriable !== null) {
+            throw InvalidWorkflowDefinition::retriableWaitWithoutHeartbeat($retriable->key, $workflow);
         }
     }
 
@@ -497,24 +507,22 @@ final readonly class TimeRules
      */
     public function scheduleStatesHaveAScheduleEdge(string $workflow, array $states): void
     {
-        foreach ($states as $state) {
-            if (! $state instanceof ScheduleState) {
-                continue;
-            }
-
-            if (! $this->hasScheduleEdge($state)) {
-                throw InvalidWorkflowDefinition::scheduleStateMissingScheduleEdge($state->key, $workflow);
-            }
+        $edgeless = array_find(
+            $states,
+            fn (State $state): bool => $state instanceof ScheduleState && ! $this->hasScheduleEdge($state),
+        );
+        if ($edgeless !== null) {
+            throw InvalidWorkflowDefinition::scheduleStateMissingScheduleEdge($edgeless->key, $workflow);
         }
     }
 
     private function hasTimeoutEdge(WaitState $wait): bool
     {
-        return array_any($wait->transitions, fn ($transition) => $transition->trigger === OnTrigger::Timeout);
+        return array_any($wait->transitions, static fn ($transition): bool => $transition->trigger === OnTrigger::Timeout);
     }
 
     private function hasScheduleEdge(ScheduleState $state): bool
     {
-        return array_any($state->transitions, fn ($transition) => $transition->trigger === OnTrigger::Schedule);
+        return array_any($state->transitions, static fn ($transition): bool => $transition->trigger === OnTrigger::Schedule);
     }
 }

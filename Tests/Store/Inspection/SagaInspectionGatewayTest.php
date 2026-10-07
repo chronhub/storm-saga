@@ -76,7 +76,7 @@ final class SagaInspectionGatewayTest extends TestCase
         // a dropped cast would hand an operator surface a value it cannot render
         $row = [...$this->instanceRow(), 'version' => '7', 'generation' => '3', 'definition_version' => '5',
             'retry_total' => '4', 'state_version' => '2', 'retimes' => '6', 'type_paused' => 1,
-            'started_at' => 1_700_000_000, 'updated_at' => 1_700_000_001, 'global_deadline_consumed_at' => null, 'waived_at' => 1_700_000_002,
+            'started_at' => 1_700_000_000, 'updated_at' => 1_700_000_001, 'global_deadline_consumed_at' => 1_700_000_008, 'waived_at' => 1_700_000_002,
             'parent_workflow_type' => 1_700_000_003, 'parent_correlation_id' => 1_700_000_004,
             'root_correlation_id' => 1_700_000_005, 'paused_at' => 1_700_000_006,
             'paused_reason' => 1_700_000_007];
@@ -93,6 +93,7 @@ final class SagaInspectionGatewayTest extends TestCase
         self::assertSame('1700000000', $snapshot->startedAt);
         self::assertSame('1700000001', $snapshot->updatedAt);
         self::assertSame('1700000002', $snapshot->waivedAt);
+        self::assertSame('1700000008', $snapshot->globalDeadlineConsumedAt);
         self::assertSame('1700000003', $snapshot->parentWorkflowType);
         self::assertSame('1700000004', $snapshot->parentCorrelationId);
         self::assertSame('1700000005', $snapshot->rootCorrelationId);
@@ -114,6 +115,7 @@ final class SagaInspectionGatewayTest extends TestCase
         self::assertNull($snapshot->startedAt);
         self::assertNull($snapshot->updatedAt);
         self::assertNull($snapshot->waivedAt);
+        self::assertNull($snapshot->globalDeadlineConsumedAt);
         self::assertNull($snapshot->pausedAt);
         self::assertNull($snapshot->pausedReason);
         self::assertNull($snapshot->parentWorkflowType);
@@ -320,7 +322,7 @@ final class SagaInspectionGatewayTest extends TestCase
     {
         $typed = [...self::summaryRow(), 'version' => '7', 'generation' => '3', 'definition_version' => '5',
             'retry_total' => '4', 'type_paused' => 1, 'started_at' => 1_700_000_030,
-            'updated_at' => 1_700_000_031, 'global_deadline_consumed_at' => null, 'waived_at' => 1_700_000_032,
+            'updated_at' => 1_700_000_031, 'global_deadline_consumed_at' => 1_700_000_035, 'waived_at' => 1_700_000_032,
             'parent_correlation_id' => 1_700_000_033, 'paused_at' => 1_700_000_034];
         $bare = [...self::summaryRow(), 'started_at' => null, 'updated_at' => null, 'global_deadline_consumed_at' => null, 'waived_at' => null,
             'parent_correlation_id' => null, 'paused_at' => null, 'type_paused' => false];
@@ -335,11 +337,13 @@ final class SagaInspectionGatewayTest extends TestCase
         self::assertSame('1700000030', $sagas[0]->startedAt);
         self::assertSame('1700000031', $sagas[0]->updatedAt);
         self::assertSame('1700000032', $sagas[0]->waivedAt);
+        self::assertSame('1700000035', $sagas[0]->globalDeadlineConsumedAt);
         self::assertSame('1700000033', $sagas[0]->parentCorrelationId);
         self::assertSame('1700000034', $sagas[0]->pausedAt);
         self::assertNull($sagas[1]->startedAt);
         self::assertNull($sagas[1]->updatedAt);
         self::assertNull($sagas[1]->waivedAt);
+        self::assertNull($sagas[1]->globalDeadlineConsumedAt);
         self::assertNull($sagas[1]->parentCorrelationId);
         self::assertNull($sagas[1]->pausedAt);
         self::assertFalse($sagas[1]->typePaused);

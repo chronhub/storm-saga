@@ -80,6 +80,8 @@ final class WorkflowIndex
 
             $this->declarations[$name][$version] = $declaration;
             if ($declaration->label !== null) {
+                // @infection-ignore-all; equivalent: the duplicate-label guard above reads this set by isset()
+                // alone, which is value-agnostic; only the key's presence matters
                 $labels[$name][$declaration->label] = true;
             }
         }

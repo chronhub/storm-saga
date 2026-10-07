@@ -18,6 +18,9 @@ use Storm\Saga\Engine\DeadlineEnforcer;
  *
  * - It is degraded; a fallback salvaged the success, so the real effect is uncertain.
  *
+ * - Every forward command it issued was recalled before any relay claimed it; there is no effect to
+ *   undo, and its log entry names the recall as the reason.
+ *
  * - The global cap bounds a non-retriable effect-gating wait; releasing a possibly committed effect
  *   would create money.
  *

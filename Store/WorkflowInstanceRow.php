@@ -125,9 +125,10 @@ final readonly class WorkflowInstanceRow
     /**
      * Whether this row settled by ABORTING, halted at a dead end or rolled back, as opposed to
      * completing its flow; `Completed` is what an app-level "failed" final state still is. The settle
-     * reads this to recall the instance's still-pending outbox rows via
-     * {@see WorkflowOutboxWriter::cancelPending()}: an aborting saga's undispatched commands are moot,
-     * a completing saga's may be legitimate fire-and-forget.
+     * reads this to recall the run's still-pending forward rows via
+     * {@see WorkflowOutboxWriter::cancelPending()}: an aborting saga's undispatched forward commands
+     * are moot, save those an undo already issued pairs with, and a completing saga's may be legitimate
+     * fire-and-forget.
      */
     public function aborted(): bool
     {

@@ -7,6 +7,7 @@ namespace Storm\Saga\Engine\State;
 use Random\RandomException;
 use Storm\Clock\PointInTime;
 use Storm\Contracts\Clock\ClockExceptionContract;
+use Storm\Contracts\Random\Jitter;
 use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\CircuitBreaker\CircuitBreaker;
 use Storm\Saga\Engine\StateContext;
@@ -16,6 +17,7 @@ use Storm\Saga\Engine\Verdict\Stay;
 use Storm\Saga\Engine\Verdict\Transition;
 use Storm\Saga\Exception\MissingAsyncTimeout;
 use Storm\Saga\Exception\MissingBreakerResourceKey;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Workflow\ActivityOutcome;
 use Storm\Saga\Workflow\ActivityResult;
 use Storm\Saga\Workflow\ActivityState;
@@ -24,6 +26,8 @@ use Storm\Saga\Workflow\FailureKind;
 use Storm\Saga\Workflow\Fallback\FallbackStrategy;
 use Storm\Saga\Workflow\Metadata;
 use Storm\Saga\Workflow\RetryPolicy;
+use Storm\Saga\Workflow\WaitState;
+use Storm\Support\Random\NativeJitter;
 use Throwable;
 
 /**
@@ -36,7 +40,7 @@ use Throwable;
  *   that would land inside the visit's elapsed budget, stay and schedule a back-off kick; else the
  *   fallback if any, else the `Failure` transition.
  *
- * - Async: stay, arming the state's timeout, since the result arrives later as an event. An async
+ * - Async: stay without emitting commands, arming the state's timeout. An async
  *   state must declare a timeout; a missing deadline would let the saga wait forever, raising
  *   `MissingAsyncTimeout`.
  *
@@ -66,13 +70,16 @@ use Throwable;
  * `Rejected` stops the walk, so a later candidate cannot salvage what that rail just refused. An
  * unclassified failure keeps the standard retry, breaker, and fallback behavior.
  *
- * With no matching transition where one is needed, the saga halts.
+ * Compensable success emissions require `compensationConfirmedBy` and a selected `WaitState`.
+ * This applies to fallback salvage too. Invalid emissions raise `UnsafeActivityCommands` outside
+ * the activity failure boundary. With no matching transition and no unsafe emission, the saga halts.
  */
 final readonly class ActivityRunner
 {
     public function __construct(
         private TransitionSelector $selector,
         private ?CircuitBreaker $breaker = null,
+        private Jitter $jitter = new NativeJitter,
     ) {}
 
     /**
@@ -85,6 +92,7 @@ final readonly class ActivityRunner
      *
      * - `Halt`: a trigger with no edge to take, such as a terminal failure and no `Failure` transition.
      *
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when the activity goes async but the state declares no timeout
      * @throws MissingBreakerResourceKey when a per-instance breaker's resourceKey is absent from the run's vars
      * @throws ClockExceptionContract when a breaker cooldown instant cannot be derived
@@ -98,7 +106,7 @@ final readonly class ActivityRunner
         }
 
         if ($ctx->stimulus->isTimeout()) {
-            return $this->transitionOrHalt($state, OnTrigger::Timeout, $ctx->vars);
+            return $this->transitionOrHalt($state, $ctx, OnTrigger::Timeout, $ctx->vars);
         }
 
         // Resolve the breaker's per-instance key from the run's input vars, a no-op for a shared breaker;
@@ -120,7 +128,7 @@ final readonly class ActivityRunner
         // Async is deferred work; its real result records later, not here
 
         $verdict = match ($result->outcome) {
-            ActivityOutcome::Success => $this->transitionOrHalt($state, OnTrigger::Success, $result->vars, $result->commands),
+            ActivityOutcome::Success => $this->transitionOrHalt($state, $ctx, OnTrigger::Success, $result->vars, $result->commands),
             ActivityOutcome::Failure => $this->onFailure($state, $ctx, $result),
             ActivityOutcome::Async => $this->onAsync($state, $result, $ctx->workflowType),
         };
@@ -177,7 +185,7 @@ final readonly class ActivityRunner
         // refused: the honest Failure edge, guards or no guards. Transient and unclassified keep
         // the chain, the soft-migration path.
         return $result->kind === FailureKind::Rejected
-            ? $this->transitionOrHalt($state, OnTrigger::Failure, $result->vars)
+            ? $this->transitionOrHalt($state, $ctx, OnTrigger::Failure, $result->vars)
             : $this->fallbackOrFail($state, $ctx, $result->vars);
     }
 
@@ -282,19 +290,19 @@ final readonly class ActivityRunner
                 if ($result->outcome === ActivityOutcome::Success) {
                     // a fallback salvage becomes Success, but flagged degraded: its real effect is uncertain, so a
                     // later rollback won't blindly undo it
-                    return $this->transitionOrHalt($state, OnTrigger::Success, $result->vars, $result->commands, degraded: true);
+                    return $this->transitionOrHalt($state, $ctx, OnTrigger::Success, $result->vars, $result->commands, degraded: true);
                 }
                 if ($result->outcome === ActivityOutcome::Failure && $result->kind === FailureKind::Rejected) {
                     // the chain-stop: a verdict rendered MID-CHAIN ends the walk; the next candidate
                     // may not salvage what this rail just refused. A thrown fallback stays unclassified,
                     // runFallback catching it kind-less, and keeps walking, like any transient.
-                    return $this->transitionOrHalt($state, OnTrigger::Failure, $vars);
+                    return $this->transitionOrHalt($state, $ctx, OnTrigger::Failure, $vars);
                 }
                 // not salvaged, transient/unclassified failure or async, so try the next fallback in the chain
             }
         }
 
-        return $this->transitionOrHalt($state, OnTrigger::Failure, $vars);
+        return $this->transitionOrHalt($state, $ctx, OnTrigger::Failure, $vars);
     }
 
     /**
@@ -311,39 +319,47 @@ final readonly class ActivityRunner
     }
 
     /**
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async state declares no timeout; a missing deadline would let
      *                             the saga wait forever, so express "wait forever" as a long timeout
      */
     private function onAsync(ActivityState $state, ActivityResult $result, string $workflowType): Stay
     {
+        if ($result->commands !== []) {
+            throw UnsafeActivityCommands::async($state->key, $workflowType);
+        }
         if ($state->timeout === null) {
             throw MissingAsyncTimeout::forState($state->key, $workflowType);
         }
 
-        return new Stay([TimerOp::armTimeout($state->key, $state->timeout->seconds)], $result->vars, commands: $result->commands);
+        return new Stay([TimerOp::armTimeout($state->key, $state->timeout->seconds)], $result->vars);
     }
 
     /**
      * Delay before the next attempt: exponential `base * 2^(n-1)` or fixed, with optional jitter of
-     * plus or minus 50%.
+     * plus or minus 50%, bounded by `maxBackoffMs` including jitter.
      *
      * @return positive-int milliseconds
      */
     private function backoff(RetryPolicy $policy, int $attempt): int
     {
-        // removing the (int) cast below yields an equivalent mutant for CastInt: int*int is already int;
-        // it only bites on overflow / absurd attempt counts.
-        // Left unignored, so this statement's killed pow/subtraction mutants stay tested.
-        $ms = $policy->strategy === BackoffStrategy::Fixed
+        if ($policy->baseMs < 1) {
+            return 1;
+        }
+
+        $cap = max(1, $policy->maxBackoffMs);
+        $delay = $policy->strategy === BackoffStrategy::Fixed
             ? $policy->baseMs
-            // @infection-ignore-all; equivalent: an int base times an integral power is an int, the attempt being one or more, so the cast narrows nothing
-            : (int) ($policy->baseMs * (2 ** ($attempt - 1)));
+            : $policy->baseMs * (2 ** ($attempt - 1));
+        // Select the integer cap before casting; its float representation may exceed PHP_INT_MAX.
+        $ms = $delay >= $cap ? $cap : (int) $delay;
 
         if ($policy->jitter) {
+            $upper = $ms + min($cap - $ms, intdiv($ms, 2) + $ms % 2);
             try {
-                $ms = random_int((int) floor($ms * 0.5), (int) ceil($ms * 1.5));
+                $ms = $this->jitter->between(intdiv($ms, 2), $upper);
             } catch (RandomException) {
-                // CSPRNG unavailable, astronomically rare, so keep the un-jittered delay
+                // Keep the bounded delay when the random source is unavailable.
             }
         }
 
@@ -355,9 +371,18 @@ final readonly class ActivityRunner
      * @param  list<object>  $commands  commands the activity asked to issue, success path only
      * @param  bool  $degraded  the transition is a fallback salvage, its effect uncertain
      */
-    private function transitionOrHalt(ActivityState $state, OnTrigger $trigger, array $vars, array $commands = [], bool $degraded = false): Transition|Halt
+    private function transitionOrHalt(ActivityState $state, StateContext $ctx, OnTrigger $trigger, array $vars, array $commands = [], bool $degraded = false): Transition|Halt
     {
         $to = $this->selector->select($state, $trigger, $vars);
+
+        if ($commands !== [] && $state->compensation !== null) {
+            if ($state->compensationConfirmedBy === null) {
+                throw UnsafeActivityCommands::unconfirmed($state->key, $ctx->workflowType);
+            }
+            if ($to === null || ! $ctx->definition->state($to) instanceof WaitState) {
+                throw UnsafeActivityCommands::withoutWait($state->key, $ctx->workflowType);
+            }
+        }
 
         return $to === null
             ? new Halt($commands)

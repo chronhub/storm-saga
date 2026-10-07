@@ -52,6 +52,6 @@ final readonly class FamilyPoker
             throw InvalidChildIdentity::invalidSlot($minted['slot']);
         }
 
-        return $this->engine->pokeFamily($command->parentWorkflowType, $command->parentCorrelationId);
+        return $this->engine->pokeFamilyOrThrow($command->parentWorkflowType, $command->parentCorrelationId);
     }
 }

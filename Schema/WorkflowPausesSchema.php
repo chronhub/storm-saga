@@ -25,7 +25,7 @@ final class WorkflowPausesSchema
     public static function up(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE TABLE IF NOT EXISTS workflow_pauses (
                     workflow_type text NOT NULL,
@@ -43,7 +43,7 @@ final class WorkflowPausesSchema
     public static function down(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'DROP TABLE IF EXISTS workflow_pauses',
         ];
     }

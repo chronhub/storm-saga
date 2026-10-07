@@ -7,9 +7,11 @@ namespace Storm\Saga\Engine;
 use Storm\Contracts\Clock\ClockExceptionContract;
 use Storm\Contracts\Serializer\SerializationExceptionContract;
 use Storm\Saga\Exception\MissingAsyncTimeout;
+use Storm\Saga\Exception\SagaFenceBusy;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
@@ -36,6 +38,7 @@ interface SagaFamilyTarget
      * @throws StaleWorkflowInstance when the OCC update loses to a competing step
      * @throws WorkflowStepLimitExceeded when the replayed crossing's transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      * @throws SerializationExceptionContract when an issued command is not a serializable payload
@@ -43,4 +46,24 @@ interface SagaFamilyTarget
      * @throws Throwable when any other exception is thrown by the replayed crossing's drive
      */
     public function pokeFamily(string $workflowType, string $correlationId, ?string $causationId = null): bool;
+
+    /**
+     * Spend a parked family crossing through the delivery boundary; a held fence requests redelivery.
+     *
+     * Other outcomes retain the `pokeFamily()` contract.
+     *
+     * @throws SagaFenceBusy when a concurrent step holds the saga's fence; retry the delivery
+     * @throws WorkflowNotFound when no workflow is registered under `$workflowType`
+     * @throws WorkflowVersionNotFound when the instance's pinned version was purged while it still runs
+     * @throws StaleWorkflowInstance when the OCC update loses to a competing step
+     * @throws WorkflowStepLimitExceeded when the replayed crossing's transition chain cycles
+     * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
+     * @throws MissingAsyncTimeout when an async activity state declares no timeout
+     * @throws ClockExceptionContract when a compensation timestamp cannot be derived
+     * @throws SerializationExceptionContract when an issued command is not a serializable payload
+     * @throws SagaStorageFailure when the saga storage fails, with driver failures wrapped by the adapter
+     * @throws Throwable when any other exception is thrown by the replayed crossing's drive
+     */
+    public function pokeFamilyOrThrow(string $workflowType, string $correlationId, ?string $causationId = null): bool;
 }

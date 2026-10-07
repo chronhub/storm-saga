@@ -109,6 +109,11 @@ final class InvalidWorkflowDefinition extends LogicException implements SagaExce
         return new self(sprintf('#[Retry] %s on state "%s" in workflow "%s" holds a blank pattern — patterns match by substring, and every class name and message contains the empty string, so the entry matches EVERY error. Name an error, or drop the entry.', $list, $stateKey, $workflow));
     }
 
+    public static function retryPatternNotString(string $stateKey, string $list, string $type, string $workflow): self
+    {
+        return new self(sprintf('#[Retry] %s on state "%s" in workflow "%s" holds a pattern of type %s — patterns match error class names and messages by substring, so only a string can name an error. Write the error as a string, or drop the entry.', $list, $stateKey, $workflow, $type));
+    }
+
     public static function transitionUnreachable(string $stateKey, string $to, string $trigger, string $workflow): self
     {
         return new self(sprintf('#[On(from: "%s", trigger: "%s", to: "%s")] in workflow "%s" is unreachable — an earlier unguarded #[On] on the same trigger always answers first, so this edge never fires. Guard the earlier one, or drop this edge.', $stateKey, $trigger, $to, $workflow));

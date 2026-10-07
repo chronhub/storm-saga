@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Storm\Saga\Console;
 
+use Closure;
 use Override;
 use Storm\Saga\Outbox\SagaOutboxDrainIncomplete;
 use Storm\Saga\Outbox\SagaOutboxRelay;
@@ -46,6 +47,8 @@ final class RelaySagaOutboxCommand extends Command
 
     public function __construct(
         private readonly SagaOutboxRelay $relay,
+        /** @var Closure(): void|null */
+        private readonly ?Closure $afterIteration = null,
     ) {
         parent::__construct();
     }
@@ -80,12 +83,13 @@ final class RelaySagaOutboxCommand extends Command
         }
 
         try {
-            $result = $this->relay->drain($batch);
+            $result = $this->iterate($batch);
         } catch (SagaOutboxDrainIncomplete $e) {
-            // A transient dispatch failure: the relay fails FORWARD; what it reports here is
-            // committed, namely dispatched rows, dead-letters, the bumped back-off; the rest stays
-            // pending. Show the durable progress, then signal the scheduler to retry, the same shape
-            // and the same phrase as the event relay, so one alert rule reads both lanes.
+            // A transient dispatch failure: the relay fails FORWARD; what it reports here is what
+            // it did, the commands it dispatched and the dead-letters it wrote, committed with the
+            // back-off of every row it still held under its claim; the rest stays pending. Show that
+            // progress, then signal the scheduler to retry, the same shape and the same phrase as
+            // the event relay, so one alert rule reads both lanes.
             $io->error(sprintf(
                 'Relayed %d saga command(s), %d dead-lettered, then stopped on a publish error: %s',
                 $e->progress->published,
@@ -172,7 +176,7 @@ final class RelaySagaOutboxCommand extends Command
 
         $this->daemonLoop(function () use ($batch, &$published, &$failed): int {
             try {
-                $result = $this->relay->drain($batch);
+                $result = $this->iterate($batch);
                 $work = $result->published + $result->failed;
             } catch (SagaOutboxDrainIncomplete $e) {
                 // The progress is committed and the back-off bumped; treat the tick as idle so the
@@ -194,5 +198,17 @@ final class RelaySagaOutboxCommand extends Command
         ));
 
         return Command::SUCCESS;
+    }
+
+    private function iterate(int $batch): \Storm\Saga\Outbox\SagaOutboxDrainResult
+    {
+        try {
+            return $this->relay->drain($batch);
+        } finally {
+            try {
+                $this->afterIteration?->__invoke();
+            } catch (Throwable) {
+            }
+        }
     }
 }

@@ -50,16 +50,14 @@ final readonly class ReachabilityRules
             return; // no forced target, so nothing to reach
         }
 
-        foreach ($states as $state) {
-            $nonGatingRestingPoint = match (true) {
-                $state instanceof WaitState => ! EffectGating::gates($states, $state->key),
-                $state instanceof ActivityState => $state->timeout !== null,
-                default => false,
-            };
+        $hasNonGatingRestingPoint = array_any($states, static fn (State $state): bool => match (true) {
+            $state instanceof WaitState => ! EffectGating::gates($states, $state->key),
+            $state instanceof ActivityState => $state->timeout !== null,
+            default => false,
+        });
 
-            if ($nonGatingRestingPoint) {
-                return; // EnforceGlobalDeadline is reachable here, so the target can be driven
-            }
+        if ($hasNonGatingRestingPoint) {
+            return; // EnforceGlobalDeadline is reachable here, so the target can be driven
         }
 
         throw InvalidWorkflowDefinition::onGlobalTimeoutUnreachable($onGlobalTimeout, $workflow);
@@ -149,13 +147,17 @@ final readonly class ReachabilityRules
      */
     public function compensatableStatesAvoidCycles(string $workflow, array $states): void
     {
-        foreach ($states as $state) {
-            // a race or join state is compensatable BY CONSTRUCTION: its arms log per-arm entries,
-            // keyed (state, arm), and a revisit would duplicate those pairs exactly as a cycle
-            // duplicates a bare state key
-            if ($state instanceof ActivityState && ($state->compensation !== null || $state->race !== null || $state->join !== null) && $this->liesOnACycle($state->key, $states)) {
-                throw InvalidWorkflowDefinition::compensatableStateInCycle($state->key, $workflow);
-            }
+        // a race or join state is compensatable BY CONSTRUCTION: its arms log per-arm entries,
+        // keyed (state, arm), and a revisit would duplicate those pairs exactly as a cycle
+        // duplicates a bare state key
+        $cyclic = array_find(
+            $states,
+            fn (State $state): bool => $state instanceof ActivityState
+                && ($state->compensation !== null || $state->race !== null || $state->join !== null)
+                && $this->liesOnACycle($state->key, $states),
+        );
+        if ($cyclic !== null) {
+            throw InvalidWorkflowDefinition::compensatableStateInCycle($cyclic->key, $workflow);
         }
     }
 
@@ -173,10 +175,10 @@ final readonly class ReachabilityRules
             if (isset($seen[$key])) {
                 continue;
             }
+            // @infection-ignore-all; equivalent: the liveness rule, the one reader of this set, asks isset()
+            // alone, which is value-agnostic, as in liesOnACycle() below; only the key's presence matters
             $seen[$key] = true;
-            foreach ($this->successorsOf($key, $states) as $next) {
-                $stack[] = $next;
-            }
+            array_push($stack, ...$this->successorsOf($key, $states));
         }
 
         return $seen;
@@ -205,9 +207,7 @@ final readonly class ReachabilityRules
             // @infection-ignore-all; equivalent: the visited guard above reads this only via isset(), which
             // is value-agnostic, since true vs. false both register the key as "seen"; only the key's presence matters
             $seen[$key] = true;
-            foreach ($this->successorsOf($key, $states) as $next) {
-                $stack[] = $next;
-            }
+            array_push($stack, ...$this->successorsOf($key, $states));
         }
 
         return false;
@@ -228,14 +228,9 @@ final readonly class ReachabilityRules
             return [];
         }
 
-        $targets = [];
-        foreach ($state->transitions as $transition) {
-            if (isset($states[$transition->to])) {
-                $targets[] = $transition->to;
-            }
-        }
+        $declared = array_filter($state->transitions, static fn ($transition): bool => isset($states[$transition->to]));
 
-        return $targets;
+        return array_map(static fn ($transition): string => $transition->to, $declared) |> array_values(...);
     }
 
     /**
@@ -294,20 +289,19 @@ final readonly class ReachabilityRules
 
             $eventEdges = array_filter($state->transitions, static fn ($transition): bool => $transition->trigger === OnTrigger::Event);
 
-            foreach ($state->eventClasses as $accepted) {
-                if (! class_exists($accepted) || new ReflectionClass($accepted)->isAbstract()) {
-                    continue;
-                }
+            $unrouted = array_find(
+                $state->eventClasses,
+                static fn (string $accepted): bool => class_exists($accepted)
+                    && ! new ReflectionClass($accepted)->isAbstract()
+                    && ! array_any(
+                        $eventEdges,
+                        static fn ($transition): bool => $transition->guard === null
+                            && ($transition->onEvent === null || $transition->onEvent === $accepted),
+                    ),
+            );
 
-                $unguarded = array_any(
-                    $eventEdges,
-                    static fn ($transition): bool => $transition->guard === null
-                        && ($transition->onEvent === null || $transition->onEvent === $accepted),
-                );
-
-                if (! $unguarded) {
-                    throw InvalidWorkflowDefinition::waitEventWithoutUnguardedRoute($accepted, $state->key, $workflow);
-                }
+            if ($unrouted !== null) {
+                throw InvalidWorkflowDefinition::waitEventWithoutUnguardedRoute($unrouted, $state->key, $workflow);
             }
         }
     }
@@ -349,11 +343,13 @@ final readonly class ReachabilityRules
                 continue;
             }
 
-            foreach ($eventEdges as $on) {
-                $onEvent = $on->onEvent;
-                if ($onEvent !== null && ! array_any($classes, static fn (string $accepted): bool => is_a($onEvent, $accepted, true))) {
-                    throw InvalidWorkflowDefinition::onEventNotAccepted($onEvent, $wait->state, $workflow);
-                }
+            $unaccepted = array_find(
+                array_map(static fn (On $on): ?string => $on->onEvent, $eventEdges),
+                static fn (?string $onEvent): bool => $onEvent !== null
+                    && ! array_any($classes, static fn (string $accepted): bool => is_a($onEvent, $accepted, true)),
+            );
+            if ($unaccepted !== null) {
+                throw InvalidWorkflowDefinition::onEventNotAccepted($unaccepted, $wait->state, $workflow);
             }
         }
     }

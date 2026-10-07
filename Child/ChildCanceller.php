@@ -75,7 +75,7 @@ final readonly class ChildCanceller
             return $this->skip($command, 'type-mismatch');
         }
 
-        return $this->engine->cancel(
+        return $this->engine->cancelOrThrow(
             $child->workflowType,
             $child->correlationId,
             $command->reason,

@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Storm\Saga\Tests\Engine\State;
 
 use Override;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
+use stdClass;
 use Storm\Clock\PointInTime;
 use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\CircuitBreaker\CircuitBreaker;
@@ -25,6 +27,7 @@ use Storm\Saga\Exception\MissingAsyncTimeout;
 use Storm\Saga\Exception\MissingBreakerResourceKey;
 use Storm\Saga\Tests\Fixture\MutableClock;
 use Storm\Saga\Tests\Fixture\RecordingActivity;
+use Storm\Saga\Tests\Fixture\RecordingJitter;
 use Storm\Saga\Tests\Fixture\ThrowingActivity;
 use Storm\Saga\Workflow\ActivityResult;
 use Storm\Saga\Workflow\ActivityState;
@@ -76,6 +79,41 @@ final class ActivityRunnerTest extends TestCase
         $this->assertInstanceOf(Halt::class, $this->runner->run($this->ctx($state)));
     }
 
+    /**
+     * @param  list<object>  $commands
+     */
+    #[Test]
+    #[DataProvider('successesWithoutCompensableEmissions')]
+    public function success_without_a_compensable_emission_can_halt(ActivityState $state, array $commands): void
+    {
+        $verdict = $this->runner->run($this->ctx($state));
+
+        $this->assertInstanceOf(Halt::class, $verdict);
+        $this->assertSame($commands, $verdict->commands);
+    }
+
+    /**
+     * @return iterable<string, array{ActivityState, list<object>}>
+     */
+    public static function successesWithoutCompensableEmissions(): iterable
+    {
+        $command = new stdClass;
+
+        yield 'emission without compensation' => [
+            new ActivityState('charge', new RecordingActivity(ActivityResult::success(commands: [$command]))),
+            [$command],
+        ];
+
+        yield 'compensation without emission' => [
+            new ActivityState(
+                'charge',
+                new RecordingActivity(ActivityResult::success()),
+                compensation: new RecordingActivity(ActivityResult::success()),
+            ),
+            [],
+        ];
+    }
+
     #[Test]
     public function failure_without_a_retry_policy_takes_the_failure_transition(): void
     {
@@ -110,6 +148,145 @@ final class ActivityRunnerTest extends TestCase
         $this->assertInstanceOf(Stay::class, $second);
         $this->assertSame(['charge' => ['n' => 2, 'since' => self::NOW]], $second->retries);
         $this->assertSame(200, $second->timerOps[0]->delayMs);
+    }
+
+    #[Test]
+    public function a_large_retry_attempt_does_not_collapse_the_scheduled_delay(): void
+    {
+        $state = new ActivityState(
+            'charge',
+            new RecordingActivity(ActivityResult::failure('gateway unavailable')),
+            new RetryPolicy(maxAttempts: 100, baseMs: 1000, jitter: false),
+            transitions: [new Edge(OnTrigger::Failure, 'refund')],
+        );
+
+        $verdict = $this->runner->run($this->ctx($state, retries: ['charge' => ['n' => 69, 'since' => self::NOW]]));
+
+        self::assertInstanceOf(Stay::class, $verdict);
+        self::assertSame(TimerOpKind::ArmKick, $verdict->timerOps[0]->kind);
+        self::assertGreaterThanOrEqual(1000, $verdict->timerOps[0]->delayMs);
+    }
+
+    #[Test]
+    #[DataProvider('boundedBackoffs')]
+    public function retry_kicks_stay_inside_the_policy_cap(int $attempt, int $base, int $cap, bool $jitter, BackoffStrategy $strategy, int $lower, int $upper): void
+    {
+        $state = new ActivityState(
+            'charge',
+            new RecordingActivity(ActivityResult::failure('unavailable')),
+            new RetryPolicy(maxAttempts: 2000, strategy: $strategy, baseMs: $base, jitter: $jitter, maxBackoffMs: $cap),
+        );
+
+        $verdict = $this->runner->run($this->ctx($state, retries: ['charge' => ['n' => $attempt - 1, 'since' => self::NOW]]));
+
+        self::assertInstanceOf(Stay::class, $verdict);
+        self::assertGreaterThanOrEqual($lower, $verdict->timerOps[0]->delayMs);
+        self::assertLessThanOrEqual($upper, $verdict->timerOps[0]->delayMs);
+    }
+
+    /**
+     * @return iterable<string, array{int, int, int, bool, BackoffStrategy, int, int}>
+     */
+    public static function boundedBackoffs(): iterable
+    {
+        yield 'below cap' => [2, 100, 1000, false, BackoffStrategy::Exponential, 200, 200];
+        yield 'cap reached' => [5, 100, 1000, false, BackoffStrategy::Exponential, 1000, 1000];
+        yield 'integer overflow' => [70, 1000, 60_000, false, BackoffStrategy::Exponential, 60_000, 60_000];
+        yield 'infinite exponential' => [1100, 1000, 60_000, false, BackoffStrategy::Exponential, 60_000, 60_000];
+        yield 'jitter at cap' => [70, 1000, 60_000, true, BackoffStrategy::Exponential, 30_000, 60_000];
+        yield 'fixed exceeds cap' => [1, 2000, 1000, false, BackoffStrategy::Fixed, 1000, 1000];
+        yield 'odd jitter bounds' => [1, 5, 100, true, BackoffStrategy::Fixed, 2, 8];
+        yield 'one millisecond cap' => [1, 100, 1, true, BackoffStrategy::Fixed, 1, 1];
+        yield 'zero base with infinite power' => [1100, 0, 60_000, true, BackoffStrategy::Exponential, 1, 1];
+        yield 'largest integer cap' => [70, 1000, PHP_INT_MAX, false, BackoffStrategy::Exponential, PHP_INT_MAX, PHP_INT_MAX];
+        yield 'largest integer jitter' => [1, PHP_INT_MAX, PHP_INT_MAX, true, BackoffStrategy::Fixed, intdiv(PHP_INT_MAX, 2), PHP_INT_MAX];
+    }
+
+    #[Test]
+    #[DataProvider('jitterWindows')]
+    public function the_jitter_draws_in_the_upper_half_of_the_capped_delay(int $base, int $cap, int $low, int $high): void
+    {
+        // the range handed to the jitter IS the contract: from half the bounded delay, rounded down,
+        // to the delay plus its other half, never past the cap; each end of it becomes the kick
+        foreach ([[RecordingJitter::lowest(), max(1, $low)], [RecordingJitter::highest(), $high]] as [$jitter, $kick]) {
+            $verdict = new ActivityRunner(new TransitionSelector, jitter: $jitter)
+                ->run($this->ctx($this->jittered($base, $cap), retries: ['charge' => ['n' => 0, 'since' => self::NOW]]));
+
+            self::assertInstanceOf(Stay::class, $verdict);
+            self::assertSame([[$low, $high]], $jitter->asked);
+            self::assertSame($kick, $verdict->timerOps[0]->delayMs);
+        }
+    }
+
+    /**
+     * @return iterable<string, array{int, int, int, int}>
+     */
+    public static function jitterWindows(): iterable
+    {
+        yield 'even delay below the cap' => [100, 1000, 50, 150];
+        yield 'odd delay below the cap' => [5, 100, 2, 8];
+        yield 'delay near the cap' => [900, 1000, 450, 1000];
+        yield 'delay over the cap' => [2000, 1000, 500, 1000];
+        yield 'one millisecond cap' => [100, 1, 0, 1];
+        yield 'one millisecond delay' => [1, 1000, 0, 2];
+    }
+
+    #[Test]
+    public function a_jitter_without_a_source_of_randomness_keeps_the_bounded_delay(): void
+    {
+        // a host with no entropy still retries, at the delay the policy bounded, never at zero
+        $verdict = new ActivityRunner(new TransitionSelector, jitter: RecordingJitter::unavailable())
+            ->run($this->ctx($this->jittered(100, 1000), retries: ['charge' => ['n' => 0, 'since' => self::NOW]]));
+
+        self::assertInstanceOf(Stay::class, $verdict);
+        self::assertSame(100, $verdict->timerOps[0]->delayMs);
+    }
+
+    #[Test]
+    public function a_one_millisecond_base_still_grows_exponentially(): void
+    {
+        // the smallest valid base takes the exponential path like any other; only a base below one
+        // collapses to the floor
+        $state = new ActivityState(
+            'charge',
+            new RecordingActivity(ActivityResult::failure('unavailable')),
+            new RetryPolicy(maxAttempts: 5, baseMs: 1, jitter: false),
+        );
+
+        $verdict = $this->runner->run($this->ctx($state, retries: ['charge' => ['n' => 2, 'since' => self::NOW]]));
+
+        self::assertInstanceOf(Stay::class, $verdict);
+        self::assertSame(4, $verdict->timerOps[0]->delayMs);
+    }
+
+    #[Test]
+    public function an_undeclared_cap_bounds_the_backoff_at_one_minute(): void
+    {
+        $state = new ActivityState(
+            'charge',
+            new RecordingActivity(ActivityResult::failure('unavailable')),
+            new RetryPolicy(maxAttempts: 100, baseMs: 1000, jitter: false),
+        );
+
+        $verdict = $this->runner->run($this->ctx($state, retries: ['charge' => ['n' => 69, 'since' => self::NOW]]));
+
+        self::assertInstanceOf(Stay::class, $verdict);
+        self::assertSame(60_000, $verdict->timerOps[0]->delayMs);
+    }
+
+    #[Test]
+    public function a_requested_delay_can_exceed_the_policy_backoff_cap(): void
+    {
+        $state = new ActivityState(
+            'charge',
+            new RecordingActivity(ActivityResult::failure('throttled', retryAfterSeconds: 120)),
+            new RetryPolicy(maxAttempts: 100, baseMs: 1000, jitter: false, maxRequestedDelaySeconds: 90, maxBackoffMs: 10_000),
+        );
+
+        $verdict = $this->runner->run($this->ctx($state, retries: ['charge' => ['n' => 69, 'since' => self::NOW]]));
+
+        self::assertInstanceOf(Stay::class, $verdict);
+        self::assertSame(90_000, $verdict->timerOps[0]->delayMs);
     }
 
     #[Test]
@@ -955,6 +1132,15 @@ final class ActivityRunnerTest extends TestCase
         );
 
         $this->assertInstanceOf(Halt::class, $this->runner->run($ctx));
+    }
+
+    private function jittered(int $base, int $cap): ActivityState
+    {
+        return new ActivityState(
+            'charge',
+            new RecordingActivity(ActivityResult::failure('unavailable')),
+            new RetryPolicy(maxAttempts: 3, strategy: BackoffStrategy::Fixed, baseMs: $base, jitter: true, maxBackoffMs: $cap),
+        );
     }
 
     /**

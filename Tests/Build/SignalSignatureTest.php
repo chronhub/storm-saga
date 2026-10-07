@@ -295,6 +295,29 @@ final class SignalSignatureTest extends TestCase
         yield 'callableVars-19' => ['callableVars', false, false];
     }
 
+    #[Test]
+    public function a_parent_typed_handler_refuses_a_signal_outside_its_parent(): void
+    {
+        // `parent` names the handler class's own parent: having one is the precondition, and the
+        // signal must still BE one, never merely arrive at a class that has a parent
+        $handlers = new class() extends ArrayIterator
+        {
+            /**
+             * @param  ArrayIterator<array-key, mixed>  $signal
+             * @param  array<string, mixed>  $vars
+             */
+            public function parentSignal(parent $signal, array $vars): SignalResult
+            {
+                return SignalResult::stay([]);
+            }
+        };
+
+        $this->expectException(InvalidWorkflowDefinition::class);
+        new WorkflowBinder(new ArrayContainer([]))->bindSignalHandler(
+            new ReflectionClass($this->asObject($handlers)), new Signal(signal: stdClass::class, handler: 'parentSignal'), $handlers, 'compatibility',
+        );
+    }
+
     private function asObject(object $value): object
     {
         return $value;

@@ -17,6 +17,7 @@ use Storm\Saga\Event\SagaCompleted;
 use Storm\Saga\Event\SagaHalted;
 use Storm\Saga\Event\SagaRetried;
 use Storm\Saga\Event\SagaTransitioned;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Workflow\CompensationRecord;
@@ -97,7 +98,7 @@ final readonly class MachineCursor
      */
     private function issuedBy(string $stateKey, array $commands): array
     {
-        return array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command), $commands);
+        return array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, CommandPurpose::Forward), $commands);
     }
 
     /**

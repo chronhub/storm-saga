@@ -53,6 +53,10 @@ workflow this parent consents to engender, with the wait that consumes its concl
   (an outcome event) or `startOrThrow` (a start message): a held fence throws a *retryable*
   `SagaFenceBusy` instead of collapsing to a `false` that would ack-and-drop the signal. The `bool`
   variants (`start`, `deliver`, `deliverByCorrelation`) are for synchronous callers only.
+  The built-in cascade and family-poke handlers use `cancelOrThrow` and `pokeFamilyOrThrow` for
+  the same contention guarantee. The operator-facing `cancel` and `pokeFamily` retain their
+  boolean behavior. Custom implementations of `SagaOperator` or `SagaFamilyTarget`, including
+  implementations of the composed `SagaEngine`, must provide the corresponding throwing variants.
 - **One identity per run.** A correlation claims its identity at BIRTH and journals per generation;
   the `#[Workflow(reuse:)]` posture decides what a returning correlation means — `Reject` demands
   proof it is the same run, `Allow` accepts the window. A finished life never absorbs a new one's
@@ -66,9 +70,14 @@ workflow this parent consents to engender, with the wait that consumes its concl
 Beside the DSL, the package ships one ready-made workflow: the durable semaphore (`Semaphore/`) —
 at most N concurrent holders of a named resource, one guardian instance per resource (the
 correlation IS the resource), `SemaphoreClient` as the whole surface (`provision` / `acquireFor` /
-`release` / `renew` / `withdraw`). Acquire answers `Granted`, `Queued` or `Rejected` (the queue is
-bounded by declaration) under the guardian's fence, idempotent by token — the token is the waiter's
-identity; a promotion rides the guardian's outbox as a `GrantSlot` and wakes the waiter through the
+`release` / `renew` / `withdraw`). Acquire answers `Granted`, `Queued` or `Rejected`.
+Configured capacity and queue length are upper bounds, not reserved storage: the guardian's
+encoded JSON state can reach its byte budget first, depending on waiter identities and workflow
+names. A queue-bound refusal reports `Rejected::queueLimit`; a storage-budget refusal reports
+`Rejected::stateLimitBytes` with a null `queueLimit`. The failed acquisition rolls back before
+`SemaphoreSlotRefused` reaches the waiter; it reserves neither a holder nor a queue position.
+Stored acquisitions are idempotent by token, the waiter's identity; a refused request can succeed
+on a later retry after space is released; a promotion rides the guardian's outbox as a `GrantSlot` and wakes the waiter through the
 same seam the outcome router uses. Grants carry a TTL: the scheduled sweep expropriates a leaked
 slot (crashed holder) and promotes the queue head, `Renew` being the slow-but-alive holder's
 relief. Concurrency only — calls-per-second toward a downstream stays transport-side.
@@ -84,6 +93,11 @@ Console (`Console/`), spelled in full because a reader copies them:
 - `storm:saga:timers:audit` — name the live timers armed further out than the tempo their
   workflow declares, the trace of a clock that jumped; `--rearm` brings them to now.
 - `storm:saga:cleanup` — reconcile stranded sagas, then prune terminal bookkeeping.
+  Reconciliation advances in outbox-id order in pages of at most `--batch` candidates,
+  up to the maximum id observed at the start. A no-op or a failed settle cannot hide later
+  pages. Failures still cause a nonzero exit; unresolved rows are retried on the next run.
+  New generated ids wait for that next run. Eligibility is checked per page, so this is
+  not a snapshot of all candidates. `--dry-run` counts the traversal without settling.
 - `storm:saga:list` — the filtered listing, the way in when you have an incident and no correlation
   id: by type, status, idle time or waived budget, oldest-touched first.
 - `storm:saga:inspect` — one correlation, with its timers, issued commands and rollback log.
@@ -98,6 +112,8 @@ Console (`Console/`), spelled in full because a reader copies them:
   poison row; safe, a parked timer never fired).
 - `storm:saga:redrive` — re-send a dead-lettered command instead of cancelling the saga around it;
   refuses unless the effect is proven uncommitted, `--force --reason` owns the risk.
+- `storm:saga:redrive-batch` — preview, or `--apply` to redrive, one bounded page of commands of a
+  workflow type proven uncommitted, by creation window and id cursor; no force, JSONL output.
 - `storm:saga:versions` — pinning counts per version, plus a deploy `--check`.
 - `storm:saga:validate`: assemble every declared workflow definition and report all failures, not
   just the first. The registry assembles a graph at its first use, so this is the gate that puts the
@@ -138,3 +154,15 @@ the architecture gates and the full internal documentation live.
 promise and no legacy layer. Pin an exact 0.x tag or commit for reproducibility; pinning fixes
 history, not a stable API. Schema changes are resets, not migrations, and a reset destroys data,
 so it stays on disposable environments.*
+
+## Optional execution tracing
+
+With `storm.tracing.enabled`, the Symfony integration observes the saga unit of work, timer-target
+calls and command publisher. Step spans end when the fenced unit returns, before announcement
+listeners run. Local completion does not assert durable commit under an ambient transaction.
+Timers are short roots without an arming link because timer rows do not store that origin.
+Each publication attempt retains its stored creation context, including retries.
+
+The timer and saga-relay commands drain spans after each iteration, including idle and failed
+iterations, subject to the transaction guard on every configured Doctrine connection. No saga
+lease, retry, timer or outbox storage rule changes. See the [tracing boundaries](../Telemetry/README.md#execution-spans).

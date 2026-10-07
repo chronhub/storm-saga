@@ -33,9 +33,10 @@ use Storm\Saga\Engine\EffectEvidence;
  *   handler's writes rolled back; the effect may be out there and re-sending may DOUBLE it. The
  *   refusal is the default because it is the safe one; `--force` owns the risk explicitly.
  *
- * - `Raced`: the row moved between the write and the diagnosis, so every guard reads as satisfied
- *   while the update changed nothing. Rare, and reported rather than dressed up as one of the
- *   refusals above: a diagnosis that invents a reason is worse than one that says "try again".
+ * - `Raced`: a step held the saga's fence, or the row moved between the write and the diagnosis
+ *   so every guard reads as satisfied while the update changed nothing. Reported rather than
+ *   dressed up as one of the refusals above: a diagnosis that invents a reason is worse than one
+ *   that says "try again".
  */
 enum RedriveOutcome: string
 {

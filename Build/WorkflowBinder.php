@@ -145,6 +145,9 @@ final readonly class WorkflowBinder
                 }
             }
 
+            // equivalent mutant: without this return a union falls through to the named-type check
+            // below, which refuses it all the same; left unignored on purpose, since the FalseValue on
+            // this line and every other ReturnRemoval of this method are killed
             return false;
         }
         if ($type instanceof ReflectionIntersectionType) {

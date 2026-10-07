@@ -10,6 +10,7 @@ use Storm\Message\Message;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Store\OutboxEntry;
 use Storm\Saga\Store\WorkflowId;
+use Storm\Saga\Workflow\CompensationRecord;
 
 /**
  * The engine-facing outbox: seals the outgoing command per the hop protocol, then hands the finished
@@ -36,9 +37,9 @@ final readonly class WorkflowOutbox
      * @throws SerializationExceptionContract when the command is not a serializable payload, a wiring bug surfaced not wrapped
      * @throws InvalidMessageException when the command is itself a Message, a caller bug; see `HopProtocol::seal()`
      */
-    public function write(WorkflowId $id, object $command, string $issuedFromState, int $issuedAtVersion, int $generation, ?string $effectGroup = null): void
+    public function write(WorkflowId $id, object $command, string $issuedFromState, int $issuedAtVersion, int $generation, CommandPurpose $purpose, ?string $effectGroup = null): void
     {
-        $this->writer->write($id, $this->protocol->seal($id, $command), $issuedFromState, $issuedAtVersion, $generation, $effectGroup);
+        $this->writer->write($id, $this->protocol->seal($id, $command), $issuedFromState, $issuedAtVersion, $generation, $purpose, $effectGroup);
     }
 
     /**
@@ -55,18 +56,43 @@ final readonly class WorkflowOutbox
      */
     public function writeEntry(WorkflowId $id, OutboxEntry $entry): void
     {
-        $this->writer->write($id, $entry->message, $entry->issuedFromState, $entry->issuedAtVersion, $entry->generation, $entry->effectGroup);
+        $this->writer->write($id, $entry->message, $entry->issuedFromState, $entry->issuedAtVersion, $entry->generation, $entry->purpose, $entry->effectGroup);
     }
 
     /**
-     * The settle's recall; see the port's contract for the row-lock arbitration.
+     * The abort's recall; see the port's contract for what it touches and what it leaves.
      *
+     * @param  list<CompensationRecord>  $spared  the undone entries, whose forward rows stay pending
      * @return int the number of rows recalled
      *
      * @throws SagaStorageFailure when the storage fails, forwarded from the port
      */
-    public function cancelPending(WorkflowId $id, ?string $effectGroup = null): int
+    public function cancelPending(WorkflowId $id, int $generation, array $spared): int
     {
-        return $this->writer->cancelPending($id, $effectGroup);
+        return $this->writer->cancelPending($id, $generation, $spared);
+    }
+
+    /**
+     * The arm's proving recall; see the port's contract for what a positive count proves.
+     *
+     * @return int the number of rows recalled, the proof of a non-event when positive
+     *
+     * @throws SagaStorageFailure when the storage fails, forwarded from the port
+     */
+    public function recallUndispatched(WorkflowId $id, int $generation, string $issuedFromState, string $effectGroup): int
+    {
+        return $this->writer->recallUndispatched($id, $generation, $issuedFromState, $effectGroup);
+    }
+
+    /**
+     * The rollback's proving read; see the port's contract for what it locks and reports.
+     *
+     * @return list<bool> one flag per row, in `id` order, true when a relay claimed that row at least once
+     *
+     * @throws SagaStorageFailure when the storage fails, forwarded from the port
+     */
+    public function forwardClaims(WorkflowId $id, int $generation, string $issuedFromState, ?string $effectGroup): array
+    {
+        return $this->writer->forwardClaims($id, $generation, $issuedFromState, $effectGroup);
     }
 }

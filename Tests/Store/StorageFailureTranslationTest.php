@@ -18,6 +18,7 @@ use Storm\Saga\CircuitBreaker\Dbal\DbalCircuitBreakerStorage;
 use Storm\Saga\Exception\CorrelationAlreadyConsumed;
 use Storm\Saga\Exception\CorrelationAlreadyOwned;
 use Storm\Saga\Exception\SagaStorageFailure;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\Dbal\DbalWorkflowOutboxWriter;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
 use Storm\Saga\Store\Dbal\DbalWorkflowTimerStore;
@@ -289,7 +290,7 @@ final class StorageFailureTranslationTest extends TestCase
         $connection->expects($this->once())->method('executeStatement')->willThrowException($driverFailure);
 
         try {
-            new DbalWorkflowOutboxWriter($connection, $serializer)->write(new WorkflowId('wf', 'c-1'), new Message(new stdClass), 'charge', 0, 1);
+            new DbalWorkflowOutboxWriter($connection, $serializer)->write(new WorkflowId('wf', 'c-1'), new Message(new stdClass), 'charge', 0, 1, CommandPurpose::Forward);
             $this->fail('a driver failure on the outbox insert must surface as SagaStorageFailure');
         } catch (SagaStorageFailure $e) {
             $this->assertSame($driverFailure, $e->getPrevious());
@@ -305,8 +306,38 @@ final class StorageFailureTranslationTest extends TestCase
         $connection->expects($this->once())->method('executeStatement')->willThrowException($driverFailure);
 
         try {
-            new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->cancelPending(new WorkflowId('wf', 'c-1'));
+            new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->cancelPending(new WorkflowId('wf', 'c-1'), 1, []);
             $this->fail('a driver failure on cancelPending must surface as SagaStorageFailure');
+        } catch (SagaStorageFailure $e) {
+            $this->assertSame($driverFailure, $e->getPrevious());
+        }
+    }
+
+    #[Test]
+    public function the_outbox_writer_wraps_a_proving_recall_failure(): void
+    {
+        $driverFailure = $this->driverFailure('the recall update failed');
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->once())->method('executeStatement')->willThrowException($driverFailure);
+
+        try {
+            new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->recallUndispatched(new WorkflowId('wf', 'c-1'), 1, 'quote', 'beta');
+            $this->fail('a driver failure on recallUndispatched must surface as SagaStorageFailure');
+        } catch (SagaStorageFailure $e) {
+            $this->assertSame($driverFailure, $e->getPrevious());
+        }
+    }
+
+    #[Test]
+    public function the_outbox_writer_wraps_a_proving_read_failure(): void
+    {
+        $driverFailure = $this->driverFailure('the proving read failed');
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->once())->method('fetchFirstColumn')->willThrowException($driverFailure);
+
+        try {
+            new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->forwardClaims(new WorkflowId('wf', 'c-1'), 1, 'quote', null);
+            $this->fail('a driver failure on forwardClaims must surface as SagaStorageFailure');
         } catch (SagaStorageFailure $e) {
             $this->assertSame($driverFailure, $e->getPrevious());
         }
@@ -348,7 +379,7 @@ final class StorageFailureTranslationTest extends TestCase
 
         $this->expectException(SagaStorageFailure::class);
 
-        new DbalWorkflowOutboxWriter($this->createStub(Connection::class), $serializer)->write(new WorkflowId('wf', 'c-1'), new Message(new stdClass), 'charge', 0, 1);
+        new DbalWorkflowOutboxWriter($this->createStub(Connection::class), $serializer)->write(new WorkflowId('wf', 'c-1'), new Message(new stdClass), 'charge', 0, 1, CommandPurpose::Forward);
     }
 
     #[Test]
@@ -364,7 +395,7 @@ final class StorageFailureTranslationTest extends TestCase
 
         $this->expectException(SerializationException::class);
 
-        new DbalWorkflowOutboxWriter($connection, $serializer)->write(new WorkflowId('wf', 'c-1'), new Message(new stdClass), 'charge', 0, 1);
+        new DbalWorkflowOutboxWriter($connection, $serializer)->write(new WorkflowId('wf', 'c-1'), new Message(new stdClass), 'charge', 0, 1, CommandPurpose::Forward);
     }
 
     /**

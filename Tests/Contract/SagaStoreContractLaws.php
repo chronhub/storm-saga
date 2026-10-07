@@ -19,6 +19,7 @@ use Storm\Saga\Exception\SagaStateTooLarge;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Locking\SagaStepUnitOfWork;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\RedriveOutcome;
 use Storm\Saga\Outbox\WorkflowOutboxWriter;
 use Storm\Saga\Store\TimerKind;
@@ -28,6 +29,8 @@ use Storm\Saga\Store\WorkflowInstanceStore;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Store\WorkflowTimerStore;
 use Storm\Saga\Tests\Testing\Fixture\ReserveInventory;
+use Storm\Saga\Workflow\CompensationRecord;
+use Storm\Saga\Workflow\CompensationStatus;
 use Storm\Saga\Workflow\CorrelationReuse;
 
 /**
@@ -239,7 +242,7 @@ trait SagaStoreContractLaws
 
         foreach (['c-stranded', 'c-stranded-too', 'c-settled'] as $correlation) {
             $instances->create($this->row('law', $correlation));
-            $commands->write(new WorkflowId('law', $correlation), $this->sealed('m-'.$correlation), 'issuing', 3, 1);
+            $commands->write(new WorkflowId('law', $correlation), $this->sealed('m-'.$correlation), 'issuing', 3, 1, CommandPurpose::Forward);
             $this->publish($commands, $correlation, 'm-'.$correlation);
             $commands->markFailed($correlation, 'm-'.$correlation, 'boom', EffectEvidence::Uncommitted);
         }
@@ -257,7 +260,7 @@ trait SagaStoreContractLaws
 
         // a failure whose saga was never born, or was already deleted, has no one to strand: the
         // read joins on the instance and drops what it cannot find
-        $commands->write(new WorkflowId('law', 'c-orphan'), $this->sealed('m-orphan'), 'issuing', 3, 1);
+        $commands->write(new WorkflowId('law', 'c-orphan'), $this->sealed('m-orphan'), 'issuing', 3, 1, CommandPurpose::Forward);
         $this->publish($commands, 'c-orphan', 'm-orphan');
         $commands->markFailed('c-orphan', 'm-orphan', 'boom', EffectEvidence::Uncommitted);
 
@@ -282,7 +285,7 @@ trait SagaStoreContractLaws
 
         foreach (['c-quiet', 'c-live'] as $correlation) {
             $instances->create($this->row('law', $correlation));
-            $commands->write(new WorkflowId('law', $correlation), $this->sealed('m-'.$correlation), 'issuing', 3, 1);
+            $commands->write(new WorkflowId('law', $correlation), $this->sealed('m-'.$correlation), 'issuing', 3, 1, CommandPurpose::Forward);
             $this->publish($commands, $correlation, 'm-'.$correlation);
             $commands->markFailed($correlation, 'm-'.$correlation, 'boom', EffectEvidence::Uncommitted);
         }
@@ -316,7 +319,7 @@ trait SagaStoreContractLaws
 
         foreach (['c-page-c', 'c-page-b', 'c-page-a'] as $correlation) {
             $instances->create($this->row('law', $correlation));
-            $commands->write(new WorkflowId('law', $correlation), $this->sealed('m-'.$correlation), 'issuing', 3, 1);
+            $commands->write(new WorkflowId('law', $correlation), $this->sealed('m-'.$correlation), 'issuing', 3, 1, CommandPurpose::Forward);
             $this->publish($commands, $correlation, 'm-'.$correlation);
             $commands->markFailed($correlation, 'm-'.$correlation, 'boom', EffectEvidence::Uncommitted);
         }
@@ -379,6 +382,36 @@ trait SagaStoreContractLaws
         $this->assertSame(2, $instances->countChildren('c-parent'));
         $this->assertSame(2, $instances->countChildrenSerialized('c-parent'));
         $this->assertSame(0, $instances->countChildren('c-childless'));
+    }
+
+    #[Test]
+    public function a_parent_lists_its_living_children_as_rows(): void
+    {
+        // the cascade reads these rows to cancel what still runs: a settled child is left out, and
+        // what comes back is the row itself, never the store's own bookkeeping around it
+        $instances = $this->contractInstances();
+        $now = $this->contractNow();
+        $instances->create($this->row('law', 'c-cascade'));
+
+        foreach (['kyc', 'screening'] as $slot) {
+            $instances->create(WorkflowInstanceRow::fresh(
+                new WorkflowId('law-child', 'c-cascade'.ChildCorrelation::DELIMITER.$slot),
+                'await', [], [ParentRef::CONTEXT_KEY => new ParentRef('law', 'c-cascade', 'c-cascade', $slot, 1)->toContext()],
+                $now, 1,
+            ));
+        }
+        $settled = $instances->find(new WorkflowId('law-child', 'c-cascade'.ChildCorrelation::DELIMITER.'kyc'));
+        $this->assertNotNull($settled);
+        $instances->update(new WorkflowInstanceRow(
+            $settled->workflowType, $settled->correlationId, $settled->stateKey, WorkflowStatus::Completed,
+            context: $settled->context, version: $settled->version, generation: $settled->generation,
+        ));
+
+        $living = $instances->livingChildren('c-cascade');
+
+        $this->assertCount(1, $living);
+        $this->assertInstanceOf(WorkflowInstanceRow::class, $living[0]);
+        $this->assertSame('c-cascade'.ChildCorrelation::DELIMITER.'screening', $living[0]->correlationId);
     }
 
     #[Test]
@@ -547,7 +580,7 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-flip');
         $this->contractInstances()->create($this->row('law', 'c-flip'));
-        $commands->write($id, $this->sealed('m-flip'), 'issuing', 3, 1);
+        $commands->write($id, $this->sealed('m-flip'), 'issuing', 3, 1, CommandPurpose::Forward);
 
         $this->assertFalse($commands->markFailed('c-flip', 'm-flip', 'boom')); // pending is the relay's
         $this->assertNull($commands->provenance('c-flip', 'm-flip', 1)); // and not yet a dead letter
@@ -559,8 +592,8 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-prov');
         $this->contractInstances()->create($this->row('law', 'c-prov'));
-        $commands->write($id, $this->sealed('m-a'), 'issuing', 3, 1);
-        $commands->write($id, $this->sealed('m-b'), 'issuing', 3, 1); // same step marker: the sibling
+        $commands->write($id, $this->sealed('m-a'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-b'), 'issuing', 3, 1, CommandPurpose::Forward); // same step marker: the sibling
 
         $this->publish($commands, 'c-prov', 'm-a');
         $this->assertTrue($commands->markFailed('c-prov', 'm-a', 'boom', EffectEvidence::Uncommitted));
@@ -580,7 +613,7 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-redrive');
         $this->contractInstances()->create($this->row('law', 'c-redrive'));
-        $commands->write($id, $this->sealed('m-red'), 'issuing', 3, 1);
+        $commands->write($id, $this->sealed('m-red'), 'issuing', 3, 1, CommandPurpose::Forward);
 
         $this->assertSame(RedriveOutcome::NotFound, $commands->redrive('c-redrive', 'm-ghost'));
         $this->assertSame(RedriveOutcome::NotDeadLettered, $commands->redrive('c-redrive', 'm-red'));
@@ -594,17 +627,17 @@ trait SagaStoreContractLaws
     }
 
     #[Test]
-    public function cancel_pending_recalls_only_what_the_relay_never_claimed(): void
+    public function the_abort_recall_leaves_a_published_row_alone(): void
     {
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-recall');
         $this->contractInstances()->create($this->row('law', 'c-recall'));
-        $commands->write($id, $this->sealed('m-p1'), 'issuing', 3, 1);
-        $commands->write($id, $this->sealed('m-p2'), 'issuing', 3, 1);
+        $commands->write($id, $this->sealed('m-p1'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-p2'), 'issuing', 3, 1, CommandPurpose::Forward);
         $this->publish($commands, 'c-recall', 'm-p2');
 
-        $this->assertSame(1, $commands->cancelPending($id));
-        $this->assertSame(0, $commands->cancelPending($id)); // nothing pending is left to recall
+        $this->assertSame(1, $commands->cancelPending($id, 1, []));
+        $this->assertSame(0, $commands->cancelPending($id, 1, [])); // nothing pending is left to recall
     }
 
     #[Test]
@@ -622,7 +655,7 @@ trait SagaStoreContractLaws
             $fence->tryWithin($id, function () use ($instances, $timers, $commands, $id, $now): void {
                 $instances->create($this->row('law', 'c-atomic'));
                 $timers->arm($id, 'await', TimerKind::Timeout, $now);
-                $commands->write($id, $this->sealed('m-atomic'), 'issuing', 0, 1);
+                $commands->write($id, $this->sealed('m-atomic'), 'issuing', 0, 1, CommandPurpose::Forward);
 
                 throw new RuntimeException('the step dies after all three families were written');
             });
@@ -639,7 +672,7 @@ trait SagaStoreContractLaws
         $committed = $this->contractFence()->tryWithin($id, function () use ($instances, $timers, $commands, $id, $now): void {
             $instances->create($this->row('law', 'c-atomic'));
             $timers->arm($id, 'await', TimerKind::Timeout, $now);
-            $commands->write($id, $this->sealed('m-atomic'), 'issuing', 0, 1);
+            $commands->write($id, $this->sealed('m-atomic'), 'issuing', 0, 1, CommandPurpose::Forward);
         });
 
         $this->assertTrue($committed);
@@ -856,7 +889,7 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-anon');
         $this->contractInstances()->create($this->row('law', 'c-anon'));
-        $commands->write($id, $this->sealed('m-anon'), '', 3, 1);
+        $commands->write($id, $this->sealed('m-anon'), '', 3, 1, CommandPurpose::Forward);
 
         $this->publish($commands, 'c-anon', 'm-anon');
         $this->assertTrue($commands->markFailed('c-anon', 'm-anon', 'boom'));
@@ -870,11 +903,11 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-alone');
         $this->contractInstances()->create($this->row('law', 'c-alone'));
-        $commands->write($id, $this->sealed('m-alone'), 'issuing', 3, 1);
-        $commands->write($id, $this->sealed('m-elder'), 'issuing', 2, 1); // an EARLIER step, never a sibling
-        $commands->write($id, $this->sealed('m-past'), 'issuing', 3, 2); // another RUN, never a sibling
+        $commands->write($id, $this->sealed('m-alone'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-elder'), 'issuing', 2, 1, CommandPurpose::Forward); // an EARLIER step, never a sibling
+        $commands->write($id, $this->sealed('m-past'), 'issuing', 3, 2, CommandPurpose::Forward); // another RUN, never a sibling
         $this->contractInstances()->create($this->row('law', 'c-noise'));
-        $commands->write(new WorkflowId('law', 'c-noise'), $this->sealed('m-noise'), 'issuing', 3, 1); // another saga
+        $commands->write(new WorkflowId('law', 'c-noise'), $this->sealed('m-noise'), 'issuing', 3, 1, CommandPurpose::Forward); // another saga
 
         $this->publish($commands, 'c-alone', 'm-alone');
         $this->assertTrue($commands->markFailed('c-alone', 'm-alone', 'boom'));
@@ -890,7 +923,7 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-mid');
         $this->contractInstances()->create($this->row('law', 'c-mid'));
-        $commands->write($id, $this->sealed('m-mid'), 'issuing', 3, 1);
+        $commands->write($id, $this->sealed('m-mid'), 'issuing', 3, 1, CommandPurpose::Forward);
         $this->publish($commands, 'c-mid', 'm-mid');
 
         $this->assertFalse($commands->markFailed('c-other', 'm-mid', 'boom'));
@@ -903,16 +936,16 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-arm-recall');
         $this->contractInstances()->create($this->row('law', 'c-arm-recall'));
-        $commands->write($id, $this->sealed('m-g1'), 'issuing', 3, 1, 'left');
-        $commands->write($id, $this->sealed('m-g2'), 'issuing', 3, 1, 'right');
-        $commands->write($id, $this->sealed('m-plain'), 'issuing', 3, 1);
+        $commands->write($id, $this->sealed('m-g1'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($id, $this->sealed('m-g2'), 'issuing', 3, 1, CommandPurpose::Forward, 'right');
+        $commands->write($id, $this->sealed('m-plain'), 'issuing', 3, 1, CommandPurpose::Forward);
 
         $this->contractInstances()->create($this->row('law', 'c-neighbor'));
-        $commands->write(new WorkflowId('law', 'c-neighbor'), $this->sealed('m-nb'), 'issuing', 3, 1);
+        $commands->write(new WorkflowId('law', 'c-neighbor'), $this->sealed('m-nb'), 'issuing', 3, 1, CommandPurpose::Forward);
 
-        $this->assertSame(1, $commands->cancelPending($id, 'left'));
-        $this->assertSame(2, $commands->cancelPending($id)); // the same-type neighbor saga is untouched
-        $this->assertSame(1, $commands->cancelPending(new WorkflowId('law', 'c-neighbor')));
+        $this->assertSame(1, $commands->recallUndispatched($id, 1, 'issuing', 'left'));
+        $this->assertSame(2, $commands->cancelPending($id, 1, [])); // the same-type neighbor saga is untouched
+        $this->assertSame(1, $commands->cancelPending(new WorkflowId('law', 'c-neighbor'), 1, []));
     }
 
     #[Test]
@@ -925,11 +958,163 @@ trait SagaStoreContractLaws
         $commands = $this->contractCommands();
         $id = new WorkflowId('law', 'c-arm-order');
         $this->contractInstances()->create($this->row('law', 'c-arm-order'));
-        $commands->write($id, $this->sealed('m-other'), 'issuing', 3, 1, 'right');
-        $commands->write($id, $this->sealed('m-target'), 'issuing', 3, 1, 'left');
+        $commands->write($id, $this->sealed('m-other'), 'issuing', 3, 1, CommandPurpose::Forward, 'right');
+        $commands->write($id, $this->sealed('m-target'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
 
-        $this->assertSame(1, $commands->cancelPending($id, 'left'));
-        $this->assertSame(1, $commands->cancelPending($id)); // the other group's row is still pending
+        $this->assertSame(1, $commands->recallUndispatched($id, 1, 'issuing', 'left'));
+        $this->assertSame(1, $commands->cancelPending($id, 1, [])); // the other group's row is still pending
+    }
+
+    #[Test]
+    public function the_abort_recall_never_touches_an_undo_row(): void
+    {
+        // an undo and a cascade share the saga, the run and even the arm of forward work; only their
+        // purpose keeps them out of the recall, since the saga still owes them
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-owed');
+        $this->contractInstances()->create($this->row('law', 'c-owed'));
+        $commands->write($id, $this->sealed('m-do'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-undo'), 'issuing', 4, 1, CommandPurpose::Compensation, 'left');
+        $commands->write($id, $this->sealed('m-cascade'), 'issuing', 4, 1, CommandPurpose::Control);
+
+        $this->assertSame(1, $commands->cancelPending($id, 1, [])); // the forward row alone
+        $this->assertSame(0, $commands->recallUndispatched($id, 1, 'issuing', 'left')); // nor is the undo an arm's command
+    }
+
+    #[Test]
+    public function the_abort_recall_never_touches_another_generation(): void
+    {
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-runs');
+        $this->contractInstances()->create($this->row('law', 'c-runs'));
+        $commands->write($id, $this->sealed('m-run1'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($id, $this->sealed('m-run2'), 'issuing', 3, 2, CommandPurpose::Forward, 'left');
+
+        $this->assertSame(1, $commands->cancelPending($id, 2, []));
+        $this->assertSame(1, $commands->recallUndispatched($id, 1, 'issuing', 'left')); // run 1's row was left alone
+    }
+
+    #[Test]
+    public function the_proving_recall_never_counts_a_claimed_row(): void
+    {
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-tried');
+        $this->contractInstances()->create($this->row('law', 'c-tried'));
+        $commands->write($id, $this->sealed('m-tried'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $this->spendAnAttempt($commands, 'c-tried', 'm-tried');
+
+        $this->assertSame(0, $commands->recallUndispatched($id, 1, 'issuing', 'left'));
+        $this->assertSame(1, $commands->cancelPending($id, 1, [])); // still pending, so an abort may still stop it
+    }
+
+    #[Test]
+    public function the_abort_recall_never_touches_a_row_under_a_live_claim(): void
+    {
+        // a relay whose lease has not run out may be publishing this row right now: an abort that
+        // cancelled it would leave the command riding the bus under a row that says it was stopped
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-leased');
+        $this->contractInstances()->create($this->row('law', 'c-leased'));
+        $commands->write($id, $this->sealed('m-leased'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $this->holdUnderLiveClaim($commands, 'c-leased', 'm-leased');
+
+        $this->assertSame(0, $commands->cancelPending($id, 1, []));
+        $this->assertSame(0, $commands->recallUndispatched($id, 1, 'issuing', 'left'));
+    }
+
+    #[Test]
+    public function the_proving_read_reports_each_forward_row_of_the_step_whatever_its_status(): void
+    {
+        // a published or tried row is a claim the rollback must see, a fresh one is not; rows of another
+        // arm, state, purpose, run, saga or type are someone else's evidence
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-read');
+        $theirs = new WorkflowId('law', 'c-read-theirs');
+        $this->contractInstances()->create($this->row('law', 'c-read'));
+        $this->contractInstances()->create($this->row('law', 'c-read-theirs'));
+        $commands->write($id, $this->sealed('m-read-fresh'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-read-sent'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-read-tried'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-read-arm'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($id, $this->sealed('m-read-elsewhere'), 'elsewhere', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-read-undo'), 'issuing', 4, 1, CommandPurpose::Compensation);
+        $commands->write($id, $this->sealed('m-read-run2'), 'issuing', 3, 2, CommandPurpose::Forward);
+        $commands->write($theirs, $this->sealed('m-read-theirs'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write(new WorkflowId('law-other', 'c-read'), $this->sealed('m-read-other-type'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $this->publish($commands, 'c-read', 'm-read-sent');
+        $this->spendAnAttempt($commands, 'c-read', 'm-read-tried');
+
+        $this->assertSame([false, true, true], $commands->forwardClaims($id, 1, 'issuing', null));
+        $this->assertSame([false], $commands->forwardClaims($id, 1, 'issuing', 'left'));
+    }
+
+    #[Test]
+    public function the_abort_recall_spares_the_do_of_an_undone_entry(): void
+    {
+        // the undo already issued pairs with its do, so the do stays owed, tried or not; the spare is
+        // keyed by state and arm, so an ungrouped entry spares neither an arm's row nor another state's
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-spared');
+        $this->contractInstances()->create($this->row('law', 'c-spared'));
+        $commands->write($id, $this->sealed('m-spared-do'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-spared-tried'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $commands->write($id, $this->sealed('m-spared-arm'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($id, $this->sealed('m-spared-elsewhere'), 'elsewhere', 3, 1, CommandPurpose::Forward);
+        $this->spendAnAttempt($commands, 'c-spared', 'm-spared-tried');
+        $undone = CompensationRecord::pending('issuing')->settle(CompensationStatus::Compensated);
+
+        $this->assertSame(2, $commands->cancelPending($id, 1, [$undone]));
+        $this->assertSame(2, $commands->cancelPending($id, 1, [])); // both dos were still pending
+    }
+
+    #[Test]
+    public function the_abort_recall_spares_an_undone_arm_by_its_group(): void
+    {
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-spared-arm');
+        $this->contractInstances()->create($this->row('law', 'c-spared-arm'));
+        $commands->write($id, $this->sealed('m-spared-left'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($id, $this->sealed('m-spared-right'), 'issuing', 3, 1, CommandPurpose::Forward, 'right');
+        $commands->write($id, $this->sealed('m-spared-plain'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $undone = CompensationRecord::forArm('issuing', 'left', CompensationStatus::Compensated, false);
+
+        $this->assertSame(2, $commands->cancelPending($id, 1, [$undone])); // the sibling arm and the ungrouped row
+        $this->assertSame(1, $commands->recallUndispatched($id, 1, 'issuing', 'left')); // the spared arm stayed pending
+    }
+
+    #[Test]
+    public function the_proving_recall_never_reaches_another_saga_or_state(): void
+    {
+        // the same arm name issued by another saga of the type, and by another state of this one: the
+        // proof of one arm must never cancel a command it does not own
+        $commands = $this->contractCommands();
+        $mine = new WorkflowId('law', 'c-mine');
+        $theirs = new WorkflowId('law', 'c-theirs');
+        $this->contractInstances()->create($this->row('law', 'c-mine'));
+        $this->contractInstances()->create($this->row('law', 'c-theirs'));
+        $commands->write($mine, $this->sealed('m-mine'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($mine, $this->sealed('m-elsewhere'), 'elsewhere', 3, 1, CommandPurpose::Forward, 'left');
+        $commands->write($theirs, $this->sealed('m-theirs'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+
+        $this->assertSame(1, $commands->recallUndispatched($mine, 1, 'issuing', 'left'));
+        $this->assertSame(1, $commands->recallUndispatched($mine, 1, 'elsewhere', 'left'));
+        $this->assertSame(1, $commands->recallUndispatched($theirs, 1, 'issuing', 'left'));
+    }
+
+    #[Test]
+    public function a_redrive_keeps_the_claim_marker(): void
+    {
+        // a dead-lettered command sent back into flight is pending again, yet its first attempt may
+        // have landed: the redrive must never make it pass for a command no relay ever took
+        $commands = $this->contractCommands();
+        $id = new WorkflowId('law', 'c-redriven');
+        $this->contractInstances()->create($this->row('law', 'c-redriven'));
+        $commands->write($id, $this->sealed('m-redriven'), 'issuing', 3, 1, CommandPurpose::Forward, 'left');
+        $this->publish($commands, 'c-redriven', 'm-redriven');
+        $commands->markFailed('c-redriven', 'm-redriven', 'boom', EffectEvidence::Uncommitted);
+        $this->assertSame(RedriveOutcome::Redriven, $commands->redrive('c-redriven', 'm-redriven'));
+
+        $this->assertSame(0, $commands->recallUndispatched($id, 1, 'issuing', 'left'));
     }
 
     #[Test]
@@ -939,14 +1124,14 @@ trait SagaStoreContractLaws
         $instances = $this->contractInstances();
 
         $instances->create($this->row('law', 'c-gone'));
-        $commands->write(new WorkflowId('law', 'c-gone'), $this->sealed('m-gone'), 'issuing', 3, 1);
+        $commands->write(new WorkflowId('law', 'c-gone'), $this->sealed('m-gone'), 'issuing', 3, 1, CommandPurpose::Forward);
         $this->publish($commands, 'c-gone', 'm-gone');
         $commands->markFailed('c-gone', 'm-gone', 'boom', EffectEvidence::Uncommitted);
         $instances->delete(new WorkflowId('law', 'c-gone'));
         $this->assertSame(RedriveOutcome::SagaNotRunning, $commands->redrive('c-gone', 'm-gone'));
 
         $instances->create($this->row('law', 'c-past'));
-        $commands->write(new WorkflowId('law', 'c-past'), $this->sealed('m-past'), 'issuing', 3, 2); // sealed to a run that is not the living one
+        $commands->write(new WorkflowId('law', 'c-past'), $this->sealed('m-past'), 'issuing', 3, 2, CommandPurpose::Forward); // sealed to a run that is not the living one
         $this->publish($commands, 'c-past', 'm-past');
         $commands->markFailed('c-past', 'm-past', 'boom', EffectEvidence::Uncommitted);
         $this->assertSame(RedriveOutcome::StaleGeneration, $commands->redrive('c-past', 'm-past'));
@@ -967,4 +1152,17 @@ trait SagaStoreContractLaws
      * so the concrete supplies its adapter's honest way of marking one pending row published.
      */
     abstract protected function publish(WorkflowOutboxWriter $commands, string $correlationId, string $messageId): void;
+
+    /**
+     * Leave one pending row as a relay's failed attempt leaves it: still pending, its attempt spent
+     * and its claim marker set, through the concrete adapter's honest way of recording that attempt.
+     */
+    abstract protected function spendAnAttempt(WorkflowOutboxWriter $commands, string $correlationId, string $messageId): void;
+
+    /**
+     * Leave one pending row as a relay's live claim leaves it: still pending, its claim spent and its
+     * claim marker a lease that has not run out, through the concrete adapter's honest way of recording
+     * that claim.
+     */
+    abstract protected function holdUnderLiveClaim(WorkflowOutboxWriter $commands, string $correlationId, string $messageId): void;
 }

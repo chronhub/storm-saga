@@ -23,11 +23,7 @@ final readonly class ActivityLocator implements ContainerInterface
      */
     public function __construct(array $activities)
     {
-        $keyed = [];
-        foreach ($activities as $activity) {
-            $keyed[$activity::class] = $activity;
-        }
-        $this->activities = $keyed;
+        $this->activities = array_combine(array_map(static fn (object $activity): string => $activity::class, $activities), $activities);
     }
 
     public function get(string $id): object

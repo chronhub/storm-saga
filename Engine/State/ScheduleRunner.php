@@ -10,6 +10,7 @@ use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\Engine\StateContext;
 use Storm\Saga\Engine\TimerOp;
 use Storm\Saga\Engine\Verdict\Halt;
+use Storm\Saga\Engine\Verdict\Noop;
 use Storm\Saga\Engine\Verdict\Stay;
 use Storm\Saga\Engine\Verdict\Transition;
 use Storm\Saga\Exception\InvalidResolvedCron;
@@ -42,11 +43,16 @@ final readonly class ScheduleRunner
      * @throws ClockExceptionContract when the next slot instant cannot be derived
      * @throws InvalidResolvedCron when a per-instance cron resolves to an expression that does not parse
      */
-    public function run(StateContext $ctx): Transition|Stay|Halt
+    public function run(StateContext $ctx): Transition|Stay|Halt|Noop
     {
         $state = $ctx->state;
         if (! $state instanceof ScheduleState) {
             return new Halt; // defensive: the machine dispatches by subtype
+        }
+
+        if ($ctx->stimulus->eventOrNull() !== null) {
+            // A business event cannot replace an armed slot or release its active claim.
+            return new Noop;
         }
 
         // the per-instance grid is phased on the saga's birth, startedAt, resolved upstream; MachineRunner

@@ -36,6 +36,17 @@ final class WorkflowIdTest extends TestCase
     }
 
     #[Test]
+    public function refuses_a_nbsp_only_id(): void
+    {
+        // a no-break space survives an ASCII trim and is no control character, so neither the blank
+        // guard nor the shape rule catches it
+        $this->expectException(InvalidWorkflowId::class);
+        $this->expectExceptionMessage('A saga identity needs a non-blank "correlationId".');
+
+        new WorkflowId('payment', "\u{00A0}");
+    }
+
+    #[Test]
     public function refuses_a_workflow_type_as_readily_as_a_correlation(): void
     {
         // both halves of the key are guarded: the type is declared by a dev, but it reaches the same

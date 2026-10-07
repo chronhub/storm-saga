@@ -26,6 +26,7 @@ use Throwable;
  * is safe to undo by positional eligibility; an unconfirmed in-flight step is skipped and flagged, never
  * blindly compensated. Refused at an effect-gating wait unless `--force`: an in-flight effect is never
  * discarded on a word alone; retry after its outcome lands, or own the risk explicitly.
+ * A busy step fence refuses cancellation even with `--force`; retry after the concurrent step finishes.
  *
  * Examples:
  *
@@ -84,9 +85,10 @@ final class SagaCancelCommand extends Command
         }
 
         $io->warning(sprintf(
-            'Saga %s/%s was NOT cancelled — it does not exist, already settled, or sits at an '
-            .'effect-gating wait (an in-flight effect is never discarded on a word alone: retry '
-            .'after its outcome lands, or re-run with --force to own the risk).',
+            'Saga %s/%s was NOT cancelled — it does not exist, already settled, is behind a busy step fence, '
+            .'or sits at an effect-gating wait. For a busy step fence, retry after the concurrent step finishes; '
+            .'--force does not bypass the fence. At an effect-gating wait, retry after the outcome lands '
+            .'or re-run with --force to own the risk.',
             $type, $correlationId,
         ));
 

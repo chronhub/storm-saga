@@ -4,8 +4,12 @@ declare(strict_types=1);
 
 namespace Storm\Saga\Tests\Workflow;
 
+use Exception;
+use LogicException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use RuntimeException;
 use stdClass;
 use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\Workflow\Activity;
@@ -17,6 +21,7 @@ use Storm\Saga\Workflow\State;
 use Storm\Saga\Workflow\Transition;
 use Storm\Saga\Workflow\WaitState;
 use Storm\Saga\Workflow\WorkflowDefinition;
+use Throwable;
 
 /**
  * The reachability question the engine asks before discarding a delivered event: could an instance
@@ -25,6 +30,62 @@ use Storm\Saga\Workflow\WorkflowDefinition;
  */
 final class CanStillAcceptTest extends TestCase
 {
+    /**
+     * @param  list<class-string>  $classes
+     * @param  list<string>  $aliases
+     */
+    #[Test]
+    #[DataProvider('compatibleWaitDeclarations')]
+    public function a_wait_accepting_a_supertype_or_an_alias_is_never_ruled_out(array $classes, array $aliases): void
+    {
+        $definition = new WorkflowDefinition('compatible', [
+            'gate' => new WaitState('gate', eventClasses: [FirstEvent::class], transitions: [new Transition(OnTrigger::Event, 'future')]),
+            'future' => new WaitState(
+                'future',
+                eventClasses: $classes,
+                eventTypes: $aliases,
+                matcher: static fn (object $event, array $vars): bool => throw new LogicException('Reachability must not execute a matcher.'),
+            ),
+        ], 'gate');
+
+        self::assertTrue($definition->canStillAccept('gate', RuntimeException::class));
+        self::assertTrue($definition->canStillAccept('future', RuntimeException::class));
+    }
+
+    /**
+     * @return iterable<string, array{list<class-string>, list<string>}>
+     */
+    public static function compatibleWaitDeclarations(): iterable
+    {
+        yield 'interface' => [[Throwable::class], []];
+        yield 'parent class' => [[Exception::class], []];
+        yield 'stable alias' => [[], ['payment.confirmed']];
+    }
+
+    #[Test]
+    public function an_unreachable_alias_wait_does_not_prevent_discarding_an_impossible_event(): void
+    {
+        $definition = new WorkflowDefinition('past_alias', [
+            'past' => new WaitState('past', eventTypes: ['payment.confirmed'], transitions: [new Transition(OnTrigger::Event, 'current')]),
+            'current' => new WaitState('current', eventClasses: [FirstEvent::class], transitions: [new Transition(OnTrigger::Event, 'done')]),
+            'done' => new FinalState('done'),
+        ], 'past');
+
+        self::assertTrue($definition->canStillAccept('past', RuntimeException::class));
+        self::assertFalse($definition->canStillAccept('current', RuntimeException::class));
+        self::assertFalse($definition->canStillAccept('done', RuntimeException::class));
+    }
+
+    #[Test]
+    public function a_wait_for_a_subtype_does_not_accept_its_parent_class(): void
+    {
+        $definition = new WorkflowDefinition('specific', [
+            'await' => new WaitState('await', eventClasses: [RuntimeException::class]),
+        ], 'await');
+
+        self::assertFalse($definition->canStillAccept('await', Exception::class));
+    }
+
     #[Test]
     public function a_class_no_wait_declares_is_never_acceptable(): void
     {
@@ -99,6 +160,23 @@ final class CanStillAcceptTest extends TestCase
         $def = new WorkflowDefinition('guarded', [
             'gate' => new WaitState('gate', eventClasses: [FirstEvent::class], transitions: [
                 new Transition(OnTrigger::Event, 'await_two', guard: static fn (array $vars): bool => false),
+            ]),
+            'await_two' => new WaitState('await_two', eventClasses: [SecondEvent::class]),
+        ], 'gate');
+
+        self::assertTrue($def->canStillAccept('gate', SecondEvent::class));
+    }
+
+    #[Test]
+    public function an_undeclared_target_is_skipped_and_never_ends_the_walk(): void
+    {
+        // the builder refuses an undeclared target, so this definition is hand-made; what it proves is
+        // the walk's own discipline: the frontier pops `ghost` first, and giving up there would answer
+        // "certainly never" for a wait one edge away
+        $def = new WorkflowDefinition('undeclared', [
+            'gate' => new WaitState('gate', eventClasses: [FirstEvent::class], transitions: [
+                new Transition(OnTrigger::Event, 'await_two'),
+                new Transition(OnTrigger::Event, 'ghost'),
             ]),
             'await_two' => new WaitState('await_two', eventClasses: [SecondEvent::class]),
         ], 'gate');

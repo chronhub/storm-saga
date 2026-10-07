@@ -23,6 +23,7 @@ use Storm\Saga\Console\SagaCancelCommand;
 use Storm\Saga\Console\SagaChildrenCommand;
 use Storm\Saga\Console\SagaCleanupCommand;
 use Storm\Saga\Console\SagaPauseCommand;
+use Storm\Saga\Console\SagaRedriveBatchCommand;
 use Storm\Saga\Console\SagaRedriveCommand;
 use Storm\Saga\Console\SagaResumeCommand;
 use Storm\Saga\Console\SagaStateMigrateCommand;
@@ -38,6 +39,7 @@ use Storm\Saga\Engine\FamilyGate;
 use Storm\Saga\Engine\JoinSettler;
 use Storm\Saga\Engine\MachineRunner;
 use Storm\Saga\Engine\RaceSettler;
+use Storm\Saga\Engine\RecallJudge;
 use Storm\Saga\Engine\SagaEngine;
 use Storm\Saga\Engine\SagaFamilyTarget;
 use Storm\Saga\Engine\SagaOperator;
@@ -59,7 +61,9 @@ use Storm\Saga\Engine\StepPolicy;
 use Storm\Saga\Engine\WaitEscalator;
 use Storm\Saga\Locking\Dbal\PgAdvisoryFence;
 use Storm\Saga\Locking\SagaStepUnitOfWork;
+use Storm\Saga\Outbox\Dbal\DbalFailedWorkflowCommandBatch;
 use Storm\Saga\Outbox\Dbal\DbalWorkflowOutboxWriter;
+use Storm\Saga\Outbox\FailedWorkflowCommandBatch;
 use Storm\Saga\Outbox\FailedWorkflowCommands;
 use Storm\Saga\Outbox\HopProtocol;
 use Storm\Saga\Outbox\SagaOutboxRelay;
@@ -126,6 +130,7 @@ return static function (ContainerConfigurator $container): void {
     $services->set(DeadlineEnforcer::class);
     $services->set(FailedEffectSettler::class);
     $services->set(Canceller::class);
+    $services->set(RecallJudge::class);
     $services->set(RaceSettler::class);
     $services->set(StepLoader::class);
     $services->set(StepPerformer::class);
@@ -246,6 +251,12 @@ return static function (ContainerConfigurator $container): void {
 
     // storm:saga:redrive: re-send a dead-lettered command instead of cancelling a healthy saga around it.
     $services->set(SagaRedriveCommand::class)->tag('console.command');
+
+    // storm:saga:redrive-batch: preview or redrive one bounded page of commands proven uncommitted,
+    // through its own port so an app implementing FailedWorkflowCommands owes nothing to the batch.
+    $services->set(DbalFailedWorkflowCommandBatch::class);
+    $services->alias(FailedWorkflowCommandBatch::class, DbalFailedWorkflowCommandBatch::class);
+    $services->set(SagaRedriveBatchCommand::class)->tag('console.command');
 
     // storm:saga:state:migrate: the sweep that makes the lazy state migration bounded and observable;
     // each row goes through the engine's own migrate verb, never a raw UPDATE.

@@ -75,6 +75,9 @@ final class ValidateSagaCommand extends Command
                 try {
                     $this->registry->get($name, $version);
                 } catch (Throwable $e) {
+                    // the table renders a scalar cell as its string, so the cast answers the row shape
+                    // alone and dropping it is an equivalent mutant; the gate's configuration leaves out
+                    // this method's only CastString
                     $failures[] = [$name, (string) $version, $e::class, $e->getMessage()];
                 }
             }

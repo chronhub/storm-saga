@@ -18,6 +18,9 @@ namespace Storm\Saga\Schema;
  * Failed rows never land here; dead letters stay in the hot table. Under the `delete` disposal the
  * table stays empty forever, which costs nothing.
  *
+ * `purpose` travels with the row, so the trail still tells a forward effect from an undo; the claim
+ * marker does not, every archived row having been claimed by the relay that published it.
+ *
  * @see WorkflowOutboxSchema the hot table whose published rows land here
  */
 final class WorkflowOutboxArchiveSchema
@@ -28,7 +31,7 @@ final class WorkflowOutboxArchiveSchema
     public static function up(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE TABLE IF NOT EXISTS workflow_outbox_archive (
                     id                bigint NOT NULL,
@@ -42,20 +45,22 @@ final class WorkflowOutboxArchiveSchema
                     issued_at_version integer NOT NULL DEFAULT -1,
                     generation        integer NOT NULL DEFAULT 1,
                     evidence          text NOT NULL DEFAULT 'unknown',
+                    purpose           text NOT NULL DEFAULT 'forward',
                     created_at        timestamptz(6) NOT NULL,
                     archived_at       timestamptz(6) NOT NULL DEFAULT clock_timestamp(),
                     CONSTRAINT workflow_outbox_archive_pk PRIMARY KEY (id),
                     CONSTRAINT workflow_outbox_archive_evidence_chk CHECK (evidence IN ('uncommitted', 'unknown')),
+                    CONSTRAINT workflow_outbox_archive_purpose_chk CHECK (purpose IN ('forward', 'compensation', 'control')),
                     CONSTRAINT workflow_outbox_archive_attempts_chk CHECK (attempts >= 0),
                     CONSTRAINT workflow_outbox_archive_generation_chk CHECK (generation >= 1),
                     CONSTRAINT workflow_outbox_archive_issued_at_version_chk CHECK (issued_at_version >= -1)
                 )
                 SQL,
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_outbox_archive_corr_idx ON workflow_outbox_archive (correlation_id)
                 SQL,
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE INDEX IF NOT EXISTS workflow_outbox_archive_age_idx ON workflow_outbox_archive USING brin (archived_at)
                 SQL,
@@ -68,7 +73,7 @@ final class WorkflowOutboxArchiveSchema
     public static function down(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'DROP TABLE IF EXISTS workflow_outbox_archive',
         ];
     }

@@ -25,9 +25,11 @@ use Storm\Saga\Event\SagaCompleted;
 use Storm\Saga\Event\SagaGloballyTimedOut;
 use Storm\Saga\Event\SagaHalted;
 use Storm\Saga\Event\SagaTransitioned;
+use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Tests\Fixture\MutableClock;
+use Storm\Saga\Tests\Fixture\RecallOutbox;
 use Storm\Saga\Tests\Fixture\RecordingActivity;
 use Storm\Saga\Tests\Fixture\SampleEvent;
 use Storm\Saga\Tests\Fixture\StubEventResolver;
@@ -85,6 +87,25 @@ final class DeadlineEnforcerTest extends TestCase
         $this->assertCount(1, $this->of($run->announcements, SagaCompensated::class));
         $this->assertCount(1, $this->of($run->announcements, SagaCompensationSkipped::class));
         $this->assertCount(2, $run->timerOps); // the two leading cancels, nothing nested
+    }
+
+    #[Test]
+    public function an_unconfirmed_step_whose_command_never_left_is_skipped_as_recalled(): void
+    {
+        // the location-agnostic rollback skips `refund` either way; the recall names why, since its one
+        // forward command is still pending and no relay ever claimed it
+        $outbox = new RecallOutbox;
+        $outbox->issue(new WorkflowId('wf', 'c-1'), 'refund', 'm-refund');
+        $row = $this->row('await', log: [
+            CompensationRecord::pending('charge')->confirm(),
+            CompensationRecord::pending('refund'),
+        ]);
+
+        $run = $this->enforcer($outbox)->enforce($this->def(onGlobalTimeout: null), $row, new PointInTime, null);
+
+        $this->assertSame(CompensationStatus::Compensated, $run->row->compensations[0]->status);
+        $this->assertSame(CompensationStatus::Skipped, $run->row->compensations[1]->status);
+        $this->assertSame('recalled: never dispatched', $run->row->compensations[1]->reason);
     }
 
     #[Test]
@@ -155,6 +176,42 @@ final class DeadlineEnforcerTest extends TestCase
     }
 
     #[Test]
+    public function a_forced_drive_that_halts_settles_the_compensations_it_logged(): void
+    {
+        // the routing state runs, logs its own compensation and halts on the next step: what the forced
+        // drive just did is undone positionally, the one place a halted forced run is settled rather
+        // than left halted
+        $run = $this->enforcer()->enforce($this->def(onGlobalTimeout: 'settle'), $this->row('await'), new PointInTime, null);
+
+        $this->assertSame(WorkflowStatus::Compensated, $run->row->status);
+        $this->assertCount(1, $run->row->compensations);
+        $this->assertSame('settle', $run->row->compensations[0]->step);
+        $this->assertSame(CompensationStatus::Compensated, $run->row->compensations[0]->status);
+        $this->assertCount(1, $this->of($run->announcements, SagaCompensated::class));
+    }
+
+    #[Test]
+    public function a_forced_halt_settles_only_its_own_suffix_behind_the_older_log(): void
+    {
+        // the origin already logged an unconfirmable `charge`: it is flagged, never undone, and stays
+        // first. Only the two steps this drive logged carry positional evidence, so both are undone,
+        // in their logged order behind it
+        $row = $this->row('await', log: [CompensationRecord::pending('charge')]);
+
+        $run = $this->enforcer()->enforce($this->def(onGlobalTimeout: 'settle-twice'), $row, new PointInTime, null);
+
+        $this->assertSame(
+            ['charge', 'settle-twice', 'settle'],
+            array_map(static fn (CompensationRecord $record): string => $record->step, $run->row->compensations),
+        );
+        $this->assertSame(
+            [CompensationStatus::Pending, CompensationStatus::Compensated, CompensationStatus::Compensated],
+            array_map(static fn (CompensationRecord $record): CompensationStatus => $record->status, $run->row->compensations),
+        );
+        $this->assertCount(1, $this->of($run->announcements, SagaCompensationSkipped::class));
+    }
+
+    #[Test]
     public function an_unmoved_forced_drive_persists_the_forced_row_as_is(): void
     {
         // onGlobalTimeout = a bare untimed wait: the forced drive moves nothing; the forced row stands
@@ -203,6 +260,20 @@ final class DeadlineEnforcerTest extends TestCase
     }
 
     #[Test]
+    public function a_cap_already_consumed_by_recovery_halts_without_announcing_the_timeout_twice(): void
+    {
+        // recovery routing announced SagaGloballyTimedOut when it consumed the cap; the halt on a later
+        // gating wait preserves that single announcement and leads with the halt itself
+        $consumed = new WorkflowInstanceRow('wf', 'c-1', 'await', WorkflowStatus::Running, globalDeadlineConsumedAt: new PointInTime);
+
+        $run = $this->enforcer()->haltAtCap($consumed);
+
+        $this->assertSame(WorkflowStatus::Halted, $run->row->status);
+        $this->assertCount(1, $run->announcements);
+        $this->assertInstanceOf(SagaHalted::class, $run->announcements[0]);
+    }
+
+    #[Test]
     public function the_cap_on_a_retriable_gating_wait_disarms_both_timers_stamps_the_waive_and_hands_off(): void
     {
         // the global cap fell on a RETRIABLE effect-gating wait: success is inevitable, so it neither halts
@@ -228,7 +299,7 @@ final class DeadlineEnforcerTest extends TestCase
         $this->assertSame([], $run->commands);
     }
 
-    private function enforcer(): DeadlineEnforcer
+    private function enforcer(?RecallOutbox $outbox = null): DeadlineEnforcer
     {
         $selector = new TransitionSelector;
         $compensator = new Compensator(new MutableClock);
@@ -240,7 +311,7 @@ final class DeadlineEnforcerTest extends TestCase
             $compensator,
         );
 
-        return new DeadlineEnforcer($machine, $compensator);
+        return new DeadlineEnforcer($machine, $compensator, ($outbox ?? new RecallOutbox)->judge());
     }
 
     private function def(?string $onGlobalTimeout): WorkflowDefinition
@@ -256,6 +327,11 @@ final class DeadlineEnforcerTest extends TestCase
             'charge' => $charge,
             'refund' => new ActivityState('refund', new RecordingActivity(ActivityResult::success()), compensation: new RecordingActivity(ActivityResult::success()), transitions: [new Transition(OnTrigger::Success, 'await')]),
             'cleanup' => new ActivityState('cleanup', new RecordingActivity(ActivityResult::success()), transitions: [new Transition(OnTrigger::Success, 'failed')]),
+            // compensable, then a step without a transition: the forced drive logs `settle` and halts on `stop`;
+            // entered at `settle-twice`, it logs two steps before halting
+            'settle-twice' => new ActivityState('settle-twice', new RecordingActivity(ActivityResult::success()), compensation: new RecordingActivity(ActivityResult::success()), transitions: [new Transition(OnTrigger::Success, 'settle')]),
+            'settle' => new ActivityState('settle', new RecordingActivity(ActivityResult::success()), compensation: new RecordingActivity(ActivityResult::success()), transitions: [new Transition(OnTrigger::Success, 'stop')]),
+            'stop' => new ActivityState('stop', new RecordingActivity(ActivityResult::success())),
             'await' => new WaitState('await', eventClasses: [SampleEvent::class], transitions: [new Transition(OnTrigger::Event, 'done')]),
             'limbo' => new WaitState('limbo', eventClasses: [SampleEvent::class], transitions: [new Transition(OnTrigger::Event, 'done')]),
             'done' => new FinalState('done'),

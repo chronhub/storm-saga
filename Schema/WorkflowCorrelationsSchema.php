@@ -46,7 +46,7 @@ final class WorkflowCorrelationsSchema
             // in the opposite direction of the intuition: the claim OUTLIVES the instance it was born
             // with, so a key pointing at the pruned row is exactly what must not exist. Every read is by
             // primary key, so it carries no other index.
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE TABLE IF NOT EXISTS workflow_correlations (
                     correlation_id     text COLLATE "C" NOT NULL,
@@ -71,7 +71,7 @@ final class WorkflowCorrelationsSchema
             // policy between two runs is therefore obeyed at each birth rather than at the first: the
             // declaration in force is the one that decides, which is what a dev editing an attribute
             // means. The composite pk stays the numbering backstop under both policies.
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE UNIQUE INDEX IF NOT EXISTS workflow_correlations_spent_uq ON workflow_correlations (correlation_id) WHERE reuse = 'reject'
                 SQL,
@@ -84,7 +84,7 @@ final class WorkflowCorrelationsSchema
     public static function down(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'DROP TABLE IF EXISTS workflow_correlations',
         ];
     }

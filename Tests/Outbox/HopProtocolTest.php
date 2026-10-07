@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Storm\Saga\Tests\Outbox;
 
+use Closure;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use stdClass;
 use Storm\Contracts\Message\MetaIdentityGenerator;
+use Storm\Contracts\Message\TraceContextPropagation;
 use Storm\Message\ContextValues;
 use Storm\Message\Header;
 use Storm\Saga\Outbox\HopProtocol;
@@ -120,6 +122,42 @@ final class HopProtocolTest extends TestCase
     }
 
     #[Test]
+    #[Group('adversarial')]
+    public function the_live_span_replaces_any_trace_the_bag_carried(): void
+    {
+        // the bag is copied whole, so a trace carrier it happens to hold would ride out as the hop's
+        // own; only the span active at the seal may, and a key that span lacks leaves nothing stale
+        $context = new ContextValues(bag: ['origin' => 'http', 'traceparent' => 'stale-parent', 'tracestate' => 'stale-state', 'baggage' => 'stale-baggage']);
+
+        $message = $this->protocol($context, ['traceparent' => 'live-parent', 'tracestate' => 'live-state'])
+            ->seal(new WorkflowId('transfer', 't-1'), new stdClass);
+
+        $this->assertSame([
+            Header::MessageType->value => stdClass::class,
+            Header::MessageId->value => 'id-1',
+            Header::CorrelationId->value => 't-1',
+            'origin' => 'http',
+            'traceparent' => 'live-parent',
+            'tracestate' => 'live-state',
+        ], $message->headers());
+    }
+
+    #[Test]
+    #[Group('adversarial')]
+    public function with_no_active_span_no_trace_rides_the_hop(): void
+    {
+        $context = new ContextValues(bag: ['traceparent' => 'stale-parent', 'tracestate' => 'stale-state', 'baggage' => 'stale-baggage']);
+
+        $message = $this->protocol($context, [])->seal(new WorkflowId('transfer', 't-1'), new stdClass);
+
+        $this->assertSame([
+            Header::MessageType->value => stdClass::class,
+            Header::MessageId->value => 'id-1',
+            Header::CorrelationId->value => 't-1',
+        ], $message->headers());
+    }
+
+    #[Test]
     public function each_seal_mints_its_own_stable_id(): void
     {
         // the default generator: one id per seal, stable on the row, never shared across seals
@@ -133,7 +171,11 @@ final class HopProtocolTest extends TestCase
         $this->assertNotSame($first, $second);
     }
 
-    private function protocol(ContextValues $context): HopProtocol
+    /**
+     * @param  array<string, string>|null  $span  the carrier of the span active at the seal, or null
+     *                                            when no propagation is wired
+     */
+    private function protocol(ContextValues $context, ?array $span = null): HopProtocol
     {
         $identity = new class() implements MetaIdentityGenerator
         {
@@ -142,7 +184,24 @@ final class HopProtocolTest extends TestCase
                 return 'id-1';
             }
         };
+        $tracing = $span === null ? null : new readonly class($span) implements TraceContextPropagation
+        {
+            /**
+             * @param  array<string, string>  $span
+             */
+            public function __construct(private array $span) {}
 
-        return new HopProtocol($context, $identity);
+            public function capture(): array
+            {
+                return $this->span;
+            }
+
+            public function activate(array $carrier): Closure
+            {
+                return static function (): void {};
+            }
+        };
+
+        return new HopProtocol($context, $identity, $tracing);
     }
 }

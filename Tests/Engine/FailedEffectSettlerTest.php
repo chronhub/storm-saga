@@ -12,9 +12,11 @@ use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\Engine\Compensator;
 use Storm\Saga\Engine\FailedEffectSettler;
 use Storm\Saga\Event\SagaCompensated;
+use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Tests\Fixture\MutableClock;
+use Storm\Saga\Tests\Fixture\RecallOutbox;
 use Storm\Saga\Tests\Fixture\RecordingActivity;
 use Storm\Saga\Tests\Fixture\SampleEvent;
 use Storm\Saga\Workflow\ActivityResult;
@@ -41,7 +43,7 @@ final class FailedEffectSettlerTest extends TestCase
             CompensationRecord::pending('credit'),           // the dead-lettered leg, no effect committed
         ]);
 
-        $run = new FailedEffectSettler(new Compensator(new MutableClock))->settle($this->def(), $row, null);
+        $run = $this->settler()->settle($this->def(), $row, null);
 
         $this->assertSame(WorkflowStatus::Compensated, $run->row->status);
         $this->assertSame(CompensationStatus::Compensated, $run->row->compensations[0]->status); // refunded
@@ -53,26 +55,52 @@ final class FailedEffectSettlerTest extends TestCase
     #[Test]
     public function an_untracked_earlier_step_is_undone_positionally(): void
     {
-        // the settle is POSITIONAL: progression past `fee`, untracked, implies its effect happened;
-        // it rolls back too, where a location-agnostic settle would have skipped it as unverifiable
+        // the settle is POSITIONAL: `fee`, untracked, which the saga moved past with no proof that its
+        // commands never left, rolls back too, where a location-agnostic settle would have skipped it
         $row = $this->row([
             CompensationRecord::pending('fee'),     // untracked, no confirmedBy
             CompensationRecord::pending('credit'),  // the dead-lettered leg, tracked, unconfirmed
         ]);
 
-        $run = new FailedEffectSettler(new Compensator(new MutableClock))->settle($this->def(), $row, null);
+        $run = $this->settler()->settle($this->def(), $row, null);
 
         $this->assertSame(CompensationStatus::Compensated, $run->row->compensations[0]->status);
         $this->assertSame(CompensationStatus::Skipped, $run->row->compensations[1]->status);
     }
 
     #[Test]
+    public function an_earlier_step_whose_command_never_left_is_skipped_not_undone(): void
+    {
+        // `fee`'s one forward command is still pending, never claimed: the recall proves nothing left,
+        // so the positional settle skips it, and the confirmed debit still refunds
+        $outbox = new RecallOutbox;
+        $outbox->issue(new WorkflowId('transfer', 'c-1'), 'fee', 'm-fee');
+        $row = $this->row([
+            CompensationRecord::pending('fee'),
+            CompensationRecord::pending('hold')->confirm(),
+            CompensationRecord::pending('credit'),
+        ]);
+
+        $run = $this->settler($outbox)->settle($this->def(), $row, null);
+
+        $this->assertSame(CompensationStatus::Skipped, $run->row->compensations[0]->status);
+        $this->assertSame('recalled: never dispatched', $run->row->compensations[0]->reason);
+        $this->assertSame(CompensationStatus::Compensated, $run->row->compensations[1]->status);
+        $this->assertSame(WorkflowStatus::Compensated, $run->row->status);
+    }
+
+    #[Test]
     public function with_nothing_to_undo_it_halts_on_the_spot(): void
     {
-        $run = new FailedEffectSettler(new Compensator(new MutableClock))->settle($this->def(), $this->row([]), null);
+        $run = $this->settler()->settle($this->def(), $this->row([]), null);
 
         $this->assertSame(WorkflowStatus::Halted, $run->row->status);
         $this->assertSame('await_credit', $run->row->stateKey); // frozen where it sat
+    }
+
+    private function settler(?RecallOutbox $outbox = null): FailedEffectSettler
+    {
+        return new FailedEffectSettler(new Compensator(new MutableClock), ($outbox ?? new RecallOutbox)->judge());
     }
 
     private function def(): WorkflowDefinition

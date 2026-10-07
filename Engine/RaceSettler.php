@@ -13,6 +13,7 @@ use Storm\Saga\Event\CompensationFailed;
 use Storm\Saga\Event\SagaAnnouncement;
 use Storm\Saga\Event\SagaRaceSettled;
 use Storm\Saga\Exception\SagaStorageFailure;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\WorkflowOutbox;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Workflow\ActivityOutcome;
@@ -32,17 +33,17 @@ use Throwable;
  * having just arrived, so a later rollback may undo the kept effect through its own arm. Every
  * losing arm is then disposed of by what its command's evidence allows:
  *
- * - Still `pending` in the outbox: RECALLED, the targeted cancel by effect group; the relay never
- *   claimed it, so nothing happened and nothing needs undoing, and the entry joins settled
- *   `Skipped`, the proven non-event;
+ * - Still `pending` and never claimed by any relay: RECALLED by the arm's proving recall; nothing
+ *   happened and nothing needs undoing, and the entry joins settled `Skipped`, the proven non-event;
  *
- * - Already claimed or published: COMPENSATED on the spot, the arm's undo run like a rollback runs
- *   one, its commands riding the same outbox as forward work; a failed undo is flagged
- *   `CompensationFailed` and left `Failed` for reconciliation, never silently retried.
+ * - Claimed at least once, published or tried and released: COMPENSATED on the spot, the arm's undo
+ *   run like a rollback runs one, its commands riding the same outbox as forward work; a failed undo
+ *   is flagged `CompensationFailed` and left `Failed` for reconciliation, never silently retried. A
+ *   tried row stays pending for its next attempt, its undo already on the way.
  *
- * The recall-or-compensate order is the honesty of the thing: the recall's row-lock arbitration
- * against the relay decides which half each loser gets, inside the step's transaction, so the
- * decision and its consequence commit together. The residual the arm signed up for: an undo issued
+ * The recall-or-compensate order is the honesty of the thing: the claim marker decides which half
+ * each loser gets, the recall waiting out a claim still committing, inside the step's transaction, so
+ * the decision and its consequence commit together. The residual the arm signed up for: an undo issued
  * here can reach its handler BEFORE the do it undoes, since a loser that dodged the recall is still
  * traveling; an arm compensation tolerates that, the reconciliation shape at-least-once delivery
  * already demands.
@@ -104,9 +105,10 @@ final readonly class RaceSettler
         $metadata = new Metadata($origin->workflowType, $origin->correlationId, $causationId, $origin->context);
 
         foreach ($race->losersTo($winner) as $loser) {
-            if ($this->outbox->cancelPending($origin->id(), $loser->name) > 0) {
-                // never claimed by the relay: the row-lock arbitration proves nothing was dispatched,
-                // so there is nothing to undo; the one loser whose non-event is PROVEN
+            if ($this->outbox->recallUndispatched($origin->id(), $origin->generation, $raceState->key, $loser->name) > 0) {
+                // never claimed by any relay: the NULL marker, read once a claim still committing
+                // is waited out, proves nothing was dispatched, so there is nothing to undo; the
+                // one loser whose non-event is PROVEN
                 $log = [...$log, CompensationRecord::forArm($raceState->key, $loser->name, CompensationStatus::Skipped, confirmed: false, reason: 'recalled: never dispatched', at: $now)];
                 $recalled[] = $loser->name;
 
@@ -162,7 +164,7 @@ final readonly class RaceSettler
         try {
             $outcome = $loser->compensation->run($vars, $metadata);
             if ($outcome->outcome === ActivityOutcome::Success) {
-                $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, $loser->name), $outcome->commands)];
+                $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($stateKey, $command, CommandPurpose::Compensation, $loser->name), $outcome->commands)];
                 $log = [...$log, CompensationRecord::forArm($stateKey, $loser->name, CompensationStatus::Compensated, confirmed: false, at: $now)];
 
                 return [$log, $outcome->vars, $commands, $events, true];

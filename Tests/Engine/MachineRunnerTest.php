@@ -309,18 +309,16 @@ final class MachineRunnerTest extends TestCase
     }
 
     #[Test]
-    public function an_async_stay_carries_its_commands_and_authoritative_vars(): void
+    public function an_async_stay_carries_its_authoritative_vars_without_commands(): void
     {
-        $issued = new stdClass;
-        $async = new ActivityState('issue', new RecordingActivity(ActivityResult::async('job-1', ['sent' => true], [$issued])), timeout: new Timeout(10));
+        $async = new ActivityState('issue', new RecordingActivity(ActivityResult::async('job-1', ['sent' => true])), timeout: new Timeout(10));
         $def = new WorkflowDefinition('wf', ['issue' => $async], 'issue');
 
         $run = $this->machine()->run($def, $this->row('issue', vars: ['old' => 1]), Stimulus::none(), new PointInTime, null);
 
         $this->assertInstanceOf(Rested::class, $run);
         $this->assertSame(['sent' => true], $run->row->vars); // the Stay's vars are authoritative
-        $this->assertSame('issue', $run->commands[0]->fromState); // the resting state is the provenance
-        $this->assertSame($issued, $run->commands[0]->command);
+        $this->assertSame([], $run->commands);
         $this->assertSame(TimerOpKind::ArmTimeout, $run->timerOps[0]->kind);
     }
 

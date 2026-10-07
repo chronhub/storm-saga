@@ -16,6 +16,7 @@ use Storm\Saga\Exception\SagaAnnouncementFailed;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
@@ -113,6 +114,7 @@ final readonly class TimerRunner
      * @throws StaleWorkflowInstance when a driven step's OCC update loses to a competing step
      * @throws WorkflowStepLimitExceeded when a driven step's synchronous transition chain cycles
      * @throws UnknownState when a driven transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when a driven async activity state declares no timeout
      * @throws SerializationExceptionContract when a driven step's issued command is not a serializable payload
      * @throws ClockExceptionContract when the clock yields a non-canonical instant

@@ -11,12 +11,14 @@ use PHPUnit\Framework\TestCase;
 use stdClass;
 use Storm\Message\Message;
 use Storm\Saga\Exception\StaleWorkflowInstance;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\Dbal\DbalWorkflowOutboxWriter;
 use Storm\Saga\Store\Dbal\DbalWorkflowInstanceStore;
 use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Workflow\CompensationRecord;
+use Storm\Saga\Workflow\CompensationStatus;
 use Storm\Serializer\MessageSerializer;
 
 /**
@@ -110,6 +112,20 @@ final class DbalStoreBindingTest extends TestCase
     }
 
     #[Test]
+    public function the_update_parameters_bind_every_placeholder_the_update_names(): void
+    {
+        // the atomic step writer embeds `UPDATE_SQL` and binds it through this public pair, from
+        // outside the store; a placeholder the parameters miss fails only against a real server
+        preg_match_all('/(?<!:):([a-z_]+)/', DbalWorkflowInstanceStore::UPDATE_SQL, $placeholders);
+        $parameters = DbalWorkflowInstanceStore::updateParameters($this->row());
+
+        $this->assertNotEmpty($placeholders[1]);
+        foreach ($placeholders[1] as $placeholder) {
+            $this->assertArrayHasKey($placeholder, $parameters);
+        }
+    }
+
+    #[Test]
     public function an_update_that_matches_no_row_is_a_concurrency_conflict(): void
     {
         // the OCC verdict reads the affected-row COUNT: zero means the stored version moved on, so a
@@ -184,12 +200,13 @@ final class DbalStoreBindingTest extends TestCase
                 'from_state' => 'charge', // the provenance pair, the settle's pairing input
                 'at_version' => 0,
                 'generation' => 1, // the seal: which RUN of this correlation issued the command
+                'purpose' => 'compensation', // the purpose handed in, never a constant: what the abort's recall reads
                 'effect_group' => null, // the targeted recall's key, null for the ungrouped common case
             ],
             ['at_version' => ParameterType::INTEGER, 'generation' => ParameterType::INTEGER],
         );
 
-        new DbalWorkflowOutboxWriter($connection, $serializer)->write(new WorkflowId('transfer', 't-1'), new Message(new stdClass), 'charge', 0, 1);
+        new DbalWorkflowOutboxWriter($connection, $serializer)->write(new WorkflowId('transfer', 't-1'), new Message(new stdClass), 'charge', 0, 1, CommandPurpose::Compensation);
     }
 
     #[Test]
@@ -198,11 +215,82 @@ final class DbalStoreBindingTest extends TestCase
         $connection = $this->createMock(Connection::class);
         $connection->expects($this->once())->method('executeStatement')->with(
             $this->stringContains('UPDATE workflow_outbox'),
-            ['type' => 'transfer', 'corr' => 't-1'],
+            ['type' => 'transfer', 'corr' => 't-1', 'generation' => 2],
+            ['generation' => ParameterType::INTEGER],
         )->willReturn(3);
 
-        $recalled = new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->cancelPending(new WorkflowId('transfer', 't-1'));
+        $recalled = new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->cancelPending(new WorkflowId('transfer', 't-1'), 2, []);
 
         $this->assertSame(3, $recalled); // the (int) cast on the affected-rows count
+    }
+
+    #[Test]
+    public function the_outbox_writer_binds_each_spared_entry_by_state_and_arm(): void
+    {
+        // one exclusion per undone entry, its group compared null-safely: an ungrouped entry spares the
+        // ungrouped rows of its state, an arm's entry the rows of that arm alone
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->once())->method('executeStatement')->with(
+            $this->logicalAnd(
+                $this->stringContains(' AND NOT (issued_from_state = :spared_state_0 AND effect_group IS NOT DISTINCT FROM :spared_group_0)'),
+                $this->stringContains(' AND NOT (issued_from_state = :spared_state_1 AND effect_group IS NOT DISTINCT FROM :spared_group_1)'),
+            ),
+            ['type' => 'transfer', 'corr' => 't-1', 'generation' => 2, 'spared_state_0' => 'charge', 'spared_group_0' => null, 'spared_state_1' => 'race', 'spared_group_1' => 'left'],
+            ['generation' => ParameterType::INTEGER],
+        )->willReturn(1);
+        $spared = [
+            CompensationRecord::pending('charge')->settle(CompensationStatus::Compensated),
+            CompensationRecord::forArm('race', 'left', CompensationStatus::Compensated, false),
+        ];
+
+        $recalled = new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->cancelPending(new WorkflowId('transfer', 't-1'), 2, $spared);
+
+        $this->assertSame(1, $recalled);
+    }
+
+    #[Test]
+    public function the_outbox_writer_locks_the_unclaimed_rows_then_reads_every_marker_as_a_claim(): void
+    {
+        $calls = [];
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->exactly(2))->method('fetchFirstColumn')->willReturnCallback(
+            static function (string $sql, array $params, array $types) use (&$calls): array {
+                $calls[] = [$sql, $params, $types];
+
+                return count($calls) === 1 ? [7] : [null, '2026-09-24 10:00:00+00'];
+            },
+        );
+
+        $claims = new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->forwardClaims(new WorkflowId('transfer', 't-1'), 2, 'quote', null);
+
+        $this->assertSame([false, true], $claims); // a NULL marker was never claimed, any stamp was
+        [$lock, $read] = $calls;
+        // the lock takes the unclaimed rows alone and never skips; the read covers every row, lock-free
+        $this->assertStringContainsString('claimed_until IS NULL', $lock[0]);
+        $this->assertStringContainsString('FOR UPDATE', $lock[0]);
+        $this->assertStringNotContainsString('SKIP LOCKED', $lock[0]);
+        $this->assertStringNotContainsString('claimed_until IS NULL', $read[0]);
+        $this->assertStringNotContainsString('FOR UPDATE', $read[0]);
+        foreach ([$lock, $read] as [$sql, $params, $types]) {
+            $this->assertStringContainsString("purpose = 'forward'", $sql);
+            $this->assertStringContainsString('ORDER BY id', $sql);
+            $this->assertSame(['type' => 'transfer', 'corr' => 't-1', 'generation' => 2, 'from_state' => 'quote', 'effect_group' => null], $params);
+            $this->assertSame(['generation' => ParameterType::INTEGER], $types);
+        }
+    }
+
+    #[Test]
+    public function the_outbox_writer_binds_the_proving_recall_columns_and_returns_the_count(): void
+    {
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->once())->method('executeStatement')->with(
+            $this->stringContains('UPDATE workflow_outbox'),
+            ['type' => 'transfer', 'corr' => 't-1', 'effect_group' => 'beta', 'generation' => 2, 'from_state' => 'quote'],
+            ['generation' => ParameterType::INTEGER],
+        )->willReturn(1);
+
+        $recalled = new DbalWorkflowOutboxWriter($connection, $this->createStub(MessageSerializer::class))->recallUndispatched(new WorkflowId('transfer', 't-1'), 2, 'quote', 'beta');
+
+        $this->assertSame(1, $recalled);
     }
 }

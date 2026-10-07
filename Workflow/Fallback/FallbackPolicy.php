@@ -28,13 +28,9 @@ final readonly class FallbackPolicy
      */
     public function candidatesFor(array $vars): array
     {
-        $applicable = [];
-        foreach ($this->candidates as $candidate) {
-            if ($candidate->applies($vars)) {
-                $applicable[] = $candidate->strategy;
-            }
-        }
-
-        return $applicable;
+        return array_column(
+            array_filter($this->candidates, static fn (FallbackCandidate $candidate): bool => $candidate->applies($vars)),
+            'strategy',
+        );
     }
 }

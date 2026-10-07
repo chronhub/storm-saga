@@ -133,6 +133,16 @@ final class ChildCancellerTest extends TestCase
                 return false;
             }
 
+            public function cancelOrThrow(string $workflowType, string $correlationId, ?string $reason = null, bool $force = false, ?string $causationId = null): bool
+            {
+                return $this->cancel($workflowType, $correlationId, $reason, $force, $causationId);
+            }
+
+            public function pokeFamilyOrThrow(string $workflowType, string $correlationId, ?string $causationId = null): bool
+            {
+                return $this->pokeFamily($workflowType, $correlationId, $causationId);
+            }
+
             public function pokeFamily(string $workflowType, string $correlationId, ?string $causationId = null): bool
             {
                 return false;

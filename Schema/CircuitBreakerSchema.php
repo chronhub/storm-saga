@@ -22,7 +22,7 @@ final class CircuitBreakerSchema
     public static function up(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             <<<'SQL'
                 CREATE TABLE IF NOT EXISTS circuit_breaker (
                     key        text PRIMARY KEY,
@@ -42,7 +42,7 @@ final class CircuitBreakerSchema
     public static function down(): array
     {
         return [
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'DROP TABLE IF EXISTS circuit_breaker',
         ];
     }

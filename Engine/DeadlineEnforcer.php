@@ -14,10 +14,13 @@ use Storm\Saga\Event\SagaGloballyTimedOut;
 use Storm\Saga\Event\SagaHalted;
 use Storm\Saga\Event\SagaTransitioned;
 use Storm\Saga\Exception\MissingAsyncTimeout;
+use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowInstanceStore;
+use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Workflow\WorkflowDefinition;
 use Throwable;
 
@@ -34,7 +37,9 @@ use Throwable;
  *   any logged-but-unverifiable steps for reconciliation.
  *
  * - Forced routing: drive from `onGlobalTimeout`, which runs, a Final completes or an activity
- *   executes; one machine, two callers.
+ *   executes; one machine, two callers. A halt settles only the compensation entries added by
+ *   this drive. Older uncertain entries stay untouched and flagged; forcing a new position does
+ *   not establish that their effects occurred.
  *
  * Pure of persistence: returns a Rested run of the row, ordered ops, announcements, and commands;
  * the shell persists and applies. The current state's timers and the consumed global deadline are
@@ -52,12 +57,15 @@ final readonly class DeadlineEnforcer
     public function __construct(
         private MachineRunner $machine,
         private Compensator $compensator,
+        private RecallJudge $recalls,
     ) {}
 
     /**
      * @throws WorkflowStepLimitExceeded when the onGlobalTimeout drive's transition chain cycles
      * @throws UnknownState when `onGlobalTimeout`, or a transition from it, targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
+     * @throws SagaStorageFailure when the recall's rows cannot be read and locked; the step rolls back whole
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      * @throws Throwable when any other exception is thrown
      */
@@ -72,7 +80,8 @@ final readonly class DeadlineEnforcer
 
         if ($this->compensator->hasConfirmedCompensation($def, $row)) {
             $halted = $row->halted();
-            $run = $this->compensator->compensate($def, $halted, new Rested($halted), $causationId, locationAgnostic: true);
+            $carried = new Rested($halted);
+            $run = $this->compensator->compensate($def, $halted, $carried, $causationId, locationAgnostic: true, recalled: $this->recalls->judge($carried));
 
             return new Rested($run->row, [$timedOut, ...$run->announcements], [...$cancels, ...$run->timerOps], $run->commands);
         }
@@ -97,7 +106,30 @@ final readonly class DeadlineEnforcer
             return new Rested($working, [$timedOut, $forced, ...$skipped], $cancels);
         }
 
+        $run = $this->settleForcedHalt($def, $row, $run, $causationId);
+
         return new Rested($run->row, [$timedOut, $forced, ...$run->announcements, ...$skipped], [...$cancels, ...$run->timerOps], $run->commands);
+    }
+
+    private function settleForcedHalt(WorkflowDefinition $def, WorkflowInstanceRow $origin, Rested $run, ?string $causationId): Rested
+    {
+        if ($run->row->status !== WorkflowStatus::Halted || $run->row->compensations === []) {
+            return $run;
+        }
+
+        // the machine appends to the carried log; only this drive's suffix has positional evidence
+        $boundary = count($origin->compensations);
+        $older = array_slice($run->row->compensations, 0, $boundary);
+        $recovery = $run->row->settled($run->row->status, $run->row->vars, array_slice($run->row->compensations, $boundary));
+        $carried = new Rested($recovery, $run->announcements, $run->timerOps, $run->commands);
+        $settled = $this->compensator->compensate($def, $recovery, $carried, $causationId, locationAgnostic: false, recalled: $this->recalls->judge($carried));
+
+        return new Rested(
+            $settled->row->settled($settled->row->status, $settled->row->vars, [...$older, ...$settled->row->compensations]),
+            $settled->announcements,
+            $settled->timerOps,
+            $settled->commands,
+        );
     }
 
     /**

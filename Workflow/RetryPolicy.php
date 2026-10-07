@@ -38,6 +38,8 @@ final readonly class RetryPolicy
         public array $doNotRetryOn = [],
         public ?int $maxElapsedSeconds = null,
         public ?int $maxRequestedDelaySeconds = null,
+        /** Maximum policy delay including jitter; requested delays have a separate grant. */
+        public int $maxBackoffMs = 60_000,
     ) {}
 
     public function shouldRetry(Throwable $error): bool

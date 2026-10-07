@@ -139,7 +139,9 @@ final readonly class WorkflowDefinition
      * the answer is "reachable in principle". That is the safe direction: a `false` means certainly
      * unreachable, and only a certain answer is allowed to discard a business fact. The resting state
      * itself is included: an event matching the current wait but declined by a guard is still an early
-     * arrival, not a dead one.
+     * arrival, not a dead one. Class declarations include their subtypes. A reachable alias-based wait
+     * also keeps the answer positive: a class alone cannot resolve an event's alias, so even an unrelated
+     * event may be retried while that wait remains reachable. Matchers and payloads are never evaluated.
      *
      * @param  class-string  $eventClass
      */
@@ -165,7 +167,8 @@ final readonly class WorkflowDefinition
                 continue; // an undeclared target is a build-time error elsewhere; nothing to walk here
             }
 
-            if ($state instanceof WaitState && in_array($eventClass, $state->eventClasses, true)) {
+            if ($state instanceof WaitState && ($state->eventTypes !== []
+                || array_any($state->eventClasses, static fn (string $accepted): bool => is_a($eventClass, $accepted, true)))) {
                 return true;
             }
 

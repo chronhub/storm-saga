@@ -7,6 +7,7 @@ namespace Storm\Saga\Tests\Engine\State;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use stdClass;
 use Storm\Clock\PointInTime;
 use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\Engine\State\ScheduleRunner;
@@ -15,6 +16,7 @@ use Storm\Saga\Engine\StateContext;
 use Storm\Saga\Engine\Stimulus;
 use Storm\Saga\Engine\TimerOpKind;
 use Storm\Saga\Engine\Verdict\Halt;
+use Storm\Saga\Engine\Verdict\Noop;
 use Storm\Saga\Engine\Verdict\Stay;
 use Storm\Saga\Engine\Verdict\Transition;
 use Storm\Saga\Exception\InvalidResolvedCron;
@@ -30,6 +32,19 @@ final class ScheduleRunnerTest extends TestCase
 {
     /** An hourly grid anchored at midnight. The catch-up tests phase on it so their slots land on the hour. */
     private const string ANCHOR = '2026-06-15T00:00:00.000000Z';
+
+    #[Test]
+    public function a_business_event_leaves_the_armed_schedule_untouched(): void
+    {
+        $verdict = $this->runner()->run($this->ctx(
+            $this->state(CatchUp::ReplayAll),
+            Stimulus::event(new stdClass),
+            PointInTime::from('2026-06-15T13:00:00.000000Z'),
+            PointInTime::from(self::ANCHOR),
+        ));
+
+        self::assertInstanceOf(Noop::class, $verdict);
+    }
 
     #[Test]
     public function a_due_slot_fires_the_schedule_edge_with_one_tick(): void

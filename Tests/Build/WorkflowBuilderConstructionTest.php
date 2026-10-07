@@ -642,6 +642,46 @@ final class WorkflowBuilderConstructionTest extends TestCase
 
     #[Test]
     #[Group('adversarial')]
+    public function rejects_a_retry_pattern_that_is_not_a_string(): void
+    {
+        // the rule reads the patterns through a closure an internal function calls in coercive mode,
+        // so `123` would arrive as "123" and pass, a pattern that never names an error
+        $wf = new #[Workflow(name: 'retries_on_a_number')]
+        #[Start(state: 'charge')]
+        #[State(key: 'charge', type: 'activity', activity: RecordingActivity::class)]
+        #[State(key: 'done', type: 'final')]
+        #[On(from: 'charge', trigger: 'success', to: 'done')]
+        // @phpstan-ignore argument.type (hostile on purpose: the declared list type is no runtime guarantee)
+        #[Retry(state: 'charge', maxAttempts: 3, retryOn: [123])]
+        class {};
+
+        $this->expectException(InvalidWorkflowDefinition::class);
+        $this->expectExceptionMessageIsOrContains('retryOn on state "charge" in workflow "retries_on_a_number" holds a pattern of type int');
+
+        $this->builder()->build($wf);
+    }
+
+    #[Test]
+    #[Group('adversarial')]
+    public function rejects_a_do_not_retry_pattern_that_is_not_a_string(): void
+    {
+        $wf = new #[Workflow(name: 'excludes_a_number')]
+        #[Start(state: 'charge')]
+        #[State(key: 'charge', type: 'activity', activity: RecordingActivity::class)]
+        #[State(key: 'done', type: 'final')]
+        #[On(from: 'charge', trigger: 'success', to: 'done')]
+        // @phpstan-ignore argument.type (hostile on purpose: the declared list type is no runtime guarantee)
+        #[Retry(state: 'charge', maxAttempts: 3, doNotRetryOn: ['TimeoutError', 42])]
+        class {};
+
+        $this->expectException(InvalidWorkflowDefinition::class);
+        $this->expectExceptionMessageIsOrContains('doNotRetryOn on state "charge" in workflow "excludes_a_number" holds a pattern of type int');
+
+        $this->builder()->build($wf);
+    }
+
+    #[Test]
+    #[Group('adversarial')]
     public function rejects_a_transition_shadowed_by_an_unguarded_sibling(): void
     {
         // the selector takes the first match, so an unguarded edge answers for every later sibling on

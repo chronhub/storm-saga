@@ -71,7 +71,7 @@ final readonly class PgAdvisoryFence implements SagaStepUnitOfWork
                     // one statement for both: the lock, and the level Postgres really runs this
                     // transaction under, which DBAL's local tracking cannot know
                     $row = $connection->fetchNumeric(
-                        /** @lang PostgreSQL */
+                        /* language=PostgreSQL */
                         "SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0)), current_setting('transaction_isolation')",
                         ['key' => $key],
                     );

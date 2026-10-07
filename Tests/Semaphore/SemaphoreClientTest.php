@@ -9,11 +9,19 @@ use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Storm\Saga\Engine\SagaEngine;
+use Storm\Saga\Exception\SagaAnnouncementFailed;
+use Storm\Saga\Exception\SagaStateTooLarge;
+use Storm\Saga\Semaphore\Event\SemaphoreSlotGranted;
+use Storm\Saga\Semaphore\Event\SemaphoreSlotRefused;
 use Storm\Saga\Semaphore\Exception\InvalidSemaphoreProvision;
 use Storm\Saga\Semaphore\Exception\SemaphoreUnavailable;
+use Storm\Saga\Semaphore\Reply\Granted;
 use Storm\Saga\Semaphore\Reply\Lost;
+use Storm\Saga\Semaphore\Reply\Queued;
+use Storm\Saga\Semaphore\Reply\Rejected;
 use Storm\Saga\Semaphore\Reply\Renewed;
 use Storm\Saga\Semaphore\SemaphoreClient;
+use Throwable;
 
 /**
  * The client's own refusals, the ones that never reach the guardian: a provision whose bounds make
@@ -22,6 +30,130 @@ use Storm\Saga\Semaphore\SemaphoreClient;
  */
 final class SemaphoreClientTest extends TestCase
 {
+    #[Test]
+    #[DataProvider('unrelatedFailures')]
+    public function acquire_does_not_translate_an_unrelated_failure(Throwable $failure): void
+    {
+        $engine = $this->createMock(SagaEngine::class);
+        $engine->expects($this->once())->method('signalFor')->willThrowException($failure);
+        $engine->expects($this->never())->method('routeOutcome');
+
+        $this->expectExceptionObject($failure);
+
+        new SemaphoreClient($engine)->acquireFor('rail:visa', 'payment', 'p-1');
+    }
+
+    /**
+     * @return iterable<string, array{Throwable}>
+     */
+    public static function unrelatedFailures(): iterable
+    {
+        yield 'another workflow' => [SagaStateTooLarge::forInstance('payment', 'rail:visa', 9000, 8192, [])];
+        yield 'another resource' => [SagaStateTooLarge::forInstance(SemaphoreClient::WORKFLOW_TYPE, 'rail:other', 9000, 8192, [])];
+        yield 'unattributed exception' => [new SagaStateTooLarge('state too large')];
+        yield 'post-step announcement' => [new SagaAnnouncementFailed(SagaStateTooLarge::forInstance(SemaphoreClient::WORKFLOW_TYPE, 'rail:visa', 9000, 8192, []))];
+    }
+
+    #[Test]
+    public function acquire_turns_its_own_oversized_state_into_a_rejection_carrying_the_limit(): void
+    {
+        // the guardian refused to grow past its storage bound: the engine rolled the step back, and
+        // the waiter hears a refusal naming that bound rather than a storage exception
+        $engine = $this->createMock(SagaEngine::class);
+        $engine->expects($this->once())->method('signalFor')
+            ->willThrowException(SagaStateTooLarge::forInstance(SemaphoreClient::WORKFLOW_TYPE, 'rail:visa', 9000, 8192, []));
+        $engine->expects($this->once())->method('routeOutcome');
+
+        $reply = new SemaphoreClient($engine)->acquireFor('rail:visa', 'payment', 'p-1');
+
+        $this->assertInstanceOf(Rejected::class, $reply);
+        $this->assertNull($reply->queueLimit);
+        $this->assertSame(8192, $reply->stateLimitBytes);
+    }
+
+    /**
+     * @param  Granted|Queued|Rejected  $answer
+     */
+    #[Test]
+    #[DataProvider('honestAcquireAnswers')]
+    public function acquire_returns_each_honest_answer_untouched(object $answer): void
+    {
+        // the refusal below is written as "none of these three": each needs its own case, or the guard
+        // reads as "one of them" just as well and a legitimate answer raises unavailability
+        $engine = $this->createStub(SagaEngine::class);
+        $engine->method('signalFor')->willReturn($answer);
+
+        $this->assertSame($answer, new SemaphoreClient($engine)->acquireFor('rail:visa', 'payment', 'p-1'));
+    }
+
+    /**
+     * @return iterable<string, array{Granted|Queued|Rejected}>
+     */
+    public static function honestAcquireAnswers(): iterable
+    {
+        yield 'granted' => [new Granted('2026-06-01T00:00:00.000000+00:00')];
+        yield 'queued' => [new Queued(2)];
+        yield 'rejected' => [new Rejected(4)];
+    }
+
+    /**
+     * @param  Granted|Queued|Rejected  $answer
+     */
+    #[Test]
+    #[DataProvider('routedOutcomes')]
+    public function acquire_routes_to_the_waiter_only_what_its_answer_settles(object $answer, ?object $routed): void
+    {
+        // a grant and a refusal each settle the waiter's wait, so each is routed to it; a queued place
+        // settles nothing yet, and routing anything for it would wake a waiter that holds no slot
+        $engine = $this->createMock(SagaEngine::class);
+        $engine->method('signalFor')->willReturn($answer);
+        if ($routed === null) {
+            $engine->expects($this->never())->method('routeOutcome');
+        } else {
+            $engine->expects($this->once())->method('routeOutcome')->with('p-1', $routed);
+        }
+
+        new SemaphoreClient($engine)->acquireFor('rail:visa', 'payment', 'p-1');
+    }
+
+    /**
+     * @return iterable<string, array{Granted|Queued|Rejected, SemaphoreSlotGranted|SemaphoreSlotRefused|null}>
+     */
+    public static function routedOutcomes(): iterable
+    {
+        yield 'granted' => [new Granted('2026-06-01T00:00:00.000000+00:00'), new SemaphoreSlotGranted('rail:visa', '2026-06-01T00:00:00.000000+00:00')];
+        yield 'queued' => [new Queued(2), null];
+        yield 'rejected' => [new Rejected(4), new SemaphoreSlotRefused('rail:visa')];
+    }
+
+    #[Test]
+    #[Group('adversarial')]
+    public function acquire_refuses_an_answer_it_cannot_read(): void
+    {
+        $engine = $this->createStub(SagaEngine::class);
+        $engine->method('signalFor')->willReturn(null);
+
+        $client = new SemaphoreClient($engine);
+
+        $this->expectException(SemaphoreUnavailable::class);
+        $this->expectExceptionMessageIsOrContains('rail:visa');
+
+        $client->acquireFor('rail:visa', 'payment', 'p-1');
+    }
+
+    #[Test]
+    public function refusal_delivery_errors_are_not_translated_into_an_acquisition_reply(): void
+    {
+        $failure = SagaStateTooLarge::forInstance(SemaphoreClient::WORKFLOW_TYPE, 'rail:visa', 9000, 8192, []);
+        $engine = $this->createMock(SagaEngine::class);
+        $engine->expects($this->once())->method('signalFor')->willReturn(new Rejected(4));
+        $engine->expects($this->once())->method('routeOutcome')->willThrowException($failure);
+
+        $this->expectExceptionObject($failure);
+
+        new SemaphoreClient($engine)->acquireFor('rail:visa', 'payment', 'p-1');
+    }
+
     /**
      * A bound that cannot describe a semaphore is refused at the door, with the offending value in
      * the message: a capacity below one grants nothing, a negative queue bounds nothing, and a TTL

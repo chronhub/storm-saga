@@ -125,7 +125,7 @@ final class SagaRedriveCommand extends Command
             RedriveOutcome::SagaNotRunning => 'The saga has settled or is gone. Re-sending would put an effect in flight that nothing will ever receive.',
             RedriveOutcome::StaleGeneration => 'That command belongs to an EARLIER run of this correlation. It must never cross into the run that replaced it.',
             RedriveOutcome::EffectUnproven => 'Nobody proved this effect rolled back, so re-sending may execute it twice. Establish what happened downstream, then pass --force --reason to own the risk.',
-            RedriveOutcome::Raced => 'The row moved while this ran — a settle or another operator got there first. Re-read it with storm:saga:inspect and try again.',
+            RedriveOutcome::Raced => 'The saga is busy or the command changed concurrently. Re-read it with storm:saga:inspect and try again.',
             RedriveOutcome::Redriven => 'Redriven.', // unreachable: applied() returned early
         };
     }

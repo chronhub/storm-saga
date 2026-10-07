@@ -8,6 +8,7 @@ use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception;
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
 use Doctrine\DBAL\ParameterType;
+use InvalidArgumentException;
 use JsonException;
 use Storm\Clock\PointInTime;
 use Storm\Contracts\Clock\ClockExceptionContract;
@@ -51,7 +52,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(function () use ($id): ?WorkflowInstanceRow {
             $row = $this->connection->fetchAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE workflow_type = :type AND correlation_id = :corr',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId],
@@ -74,7 +75,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(function () use ($correlationId): ?WorkflowInstanceRow {
             $row = $this->connection->fetchAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE correlation_id = :corr LIMIT 1',
                 ['corr' => $correlationId],
@@ -108,13 +109,13 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             // is PROVEN EQUIVALENT and deliberately left alive rather than ignored by config.
             // @infection-ignore-all; equivalent: the driver hands back a numeric string and PHP adds it as a number, so the cast documents the intent rather than changing the value
             $generation = 1 + (int) $this->connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT COALESCE(max(generation), 0) FROM workflow_correlations WHERE correlation_id = :corr',
                 ['corr' => $row->correlationId],
             );
 
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'INSERT INTO workflow_instances (workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at)
                  VALUES (:type, :corr, :state, :status, CAST(:vars AS jsonb), CAST(:retries AS jsonb), CAST(:compensations AS jsonb), CAST(:context AS jsonb), :version, :generation, :def_version, :state_version, :retry_total, :retimes, CAST(:arms AS jsonb), CAST(:families AS jsonb), CAST(:parked AS jsonb),
                          COALESCE(CAST(:started_at AS timestamptz), clock_timestamp()), CAST(:global_deadline_consumed_at AS timestamptz), CAST(:waived_at AS timestamptz))',
@@ -127,7 +128,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             // makes the pair atomic, the birth being written by the executor inside it, so a refused claim
             // takes the instance row down with it.
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'INSERT INTO workflow_correlations (correlation_id, generation, workflow_type, definition_version, reuse, claimed_at)
                  VALUES (:corr, :generation, :type, :def_version, :reuse, COALESCE(CAST(:started_at AS timestamptz), clock_timestamp()))',
                 [
@@ -206,7 +207,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         $this->guard(function () use ($id): null {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'DELETE FROM workflow_instances WHERE workflow_type = :type AND correlation_id = :corr',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId],
             );
@@ -219,8 +220,8 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(function () use ($limit): array {
             $rows = $this->connection->fetchAllNumeric(
-                /** @lang PostgreSQL */
                 sprintf(
+                    /* language=PostgreSQL */
                     "SELECT DISTINCT o.correlation_id, o.header->>'%s' AS mid
                      FROM workflow_outbox o
                      JOIN workflow_instances i ON i.correlation_id = o.correlation_id
@@ -242,11 +243,64 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         });
     }
 
+    /**
+     * Visit failed effect rows in bounded pages without waiting for earlier candidates to settle.
+     *
+     * The initial maximum outbox id bounds the pass; later generated ids wait for the next run.
+     * Status is read per page, not from a frozen snapshot. A row that becomes eligible behind the
+     * cursor also waits for the next run. Each row yields its sealed message id, including null
+     * for an unreadable header; duplicate pairs may be yielded and settling remains idempotent.
+     * The iterator opens no transaction and acquires no row lock.
+     *
+     * @return iterable<array{string, string|null}>
+     *
+     * @throws InvalidArgumentException when the page size is not positive
+     * @throws SagaStorageFailure when the ceiling or a page cannot be read
+     */
+    public function iterateStrandedByFailedEffect(int $batch = 1000): iterable
+    {
+        if ($batch < 1) {
+            throw new InvalidArgumentException('The reconcile page size must be positive.');
+        }
+
+        $ceiling = $this->guard(fn (): mixed => $this->connection->fetchOne('SELECT max(id) FROM workflow_outbox'));
+        if ($ceiling === null || $ceiling === false) {
+            return;
+        }
+
+        $after = null;
+        do {
+            $rows = $this->guard(fn (): array => $this->connection->fetchAllAssociative(
+                sprintf(
+                    /* language=PostgreSQL */
+                    "SELECT o.id, o.correlation_id, o.header->>'%s' AS mid
+                     FROM workflow_outbox o
+                     WHERE o.id <= :ceiling AND o.status = '%s'
+                       AND EXISTS (SELECT 1 FROM workflow_instances i
+                                   WHERE i.correlation_id = o.correlation_id AND i.status = '%s')".
+                    ($after === null ? '' : ' AND o.id > :after').'
+                     ORDER BY o.id LIMIT :limit',
+                    Header::MessageId->value,
+                    OutboxStatus::Failed->value,
+                    WorkflowStatus::Running->value,
+                ),
+                ['ceiling' => (int) $ceiling, 'limit' => $batch, ...($after === null ? [] : ['after' => $after])],
+                ['ceiling' => ParameterType::INTEGER, 'limit' => ParameterType::INTEGER, ...($after === null ? [] : ['after' => ParameterType::INTEGER])],
+            ));
+
+            foreach ($rows as $row) {
+                $after = (int) $row['id'];
+
+                yield [(string) $row['correlation_id'], $row['mid'] === null ? null : (string) $row['mid']];
+            }
+        } while (count($rows) === $batch);
+    }
+
     public function waivedAndQuiet(int $quietForSeconds, int $limit = 100): array
     {
         return $this->guard(function () use ($quietForSeconds, $limit): array {
             $rows = $this->connection->fetchAllAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances
                  WHERE status = 'running' AND waived_at IS NOT NULL
@@ -265,7 +319,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(function (): array {
             $rows = $this->connection->fetchAllAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "SELECT workflow_type, definition_version, count(*) AS n
                  FROM workflow_instances WHERE status = 'running'
                  GROUP BY workflow_type, definition_version",
@@ -283,7 +337,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     public function countChildren(string $parentCorrelationId): int
     {
         return $this->guard(fn (): int => (int) $this->connection->fetchOne(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'SELECT count(*) FROM workflow_instances WHERE parent_correlation_id = :parent',
             ['parent' => $parentCorrelationId],
         ));
@@ -292,7 +346,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     public function pauseInstance(WorkflowId $id, ?string $reason): bool
     {
         return $this->guard(fn (): bool => $this->connection->executeStatement(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             "UPDATE workflow_instances SET paused_at = clock_timestamp(), paused_reason = :reason
              WHERE workflow_type = :type AND correlation_id = :corr AND status = 'running' AND paused_at IS NULL",
             ['type' => $id->workflowType, 'corr' => $id->correlationId, 'reason' => $reason],
@@ -303,7 +357,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(fn (): bool => $this->connection->transactional(function () use ($id): bool {
             $lifted = $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'UPDATE workflow_instances SET paused_at = NULL, paused_reason = NULL
                  WHERE workflow_type = :type AND correlation_id = :corr AND paused_at IS NOT NULL',
                 ['type' => $id->workflowType, 'corr' => $id->correlationId],
@@ -314,7 +368,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             // resume could no longer reach the release
             if ($lifted) {
                 $this->connection->executeStatement(
-                    /** @lang PostgreSQL */
+                    /* language=PostgreSQL */
                     "UPDATE workflow_timers SET claimed_at = NULL
                      WHERE workflow_type = :type AND correlation_id = :corr
                        AND claimed_at IS NOT NULL AND parked_at IS NULL AND kind <> 'global'",
@@ -331,7 +385,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         $this->guard(fn (): int|string => $this->connection->executeStatement(
             // idempotent on purpose: the FIRST freeze's stamp and reason stand, a repeated verb
             // must not quietly rewrite the incident's audit trail
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'INSERT INTO workflow_pauses (workflow_type, reason) VALUES (:type, :reason)
              ON CONFLICT (workflow_type) DO NOTHING',
             ['type' => $workflowType, 'reason' => $reason],
@@ -342,7 +396,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(fn (): bool => $this->connection->transactional(function () use ($workflowType): bool {
             $lifted = $this->connection->executeStatement(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'DELETE FROM workflow_pauses WHERE workflow_type = :type',
                 ['type' => $workflowType],
             ) > 0;
@@ -350,7 +404,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             // same transaction as the lift, the fleet-wide twin of the instance resume's release
             if ($lifted) {
                 $this->connection->executeStatement(
-                    /** @lang PostgreSQL */
+                    /* language=PostgreSQL */
                     "UPDATE workflow_timers SET claimed_at = NULL
                      WHERE workflow_type = :type
                        AND claimed_at IS NOT NULL AND parked_at IS NULL AND kind <> 'global'",
@@ -365,7 +419,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     public function pausedType(string $workflowType): bool
     {
         return $this->guard(fn (): bool => (bool) $this->connection->fetchOne(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'SELECT EXISTS (SELECT 1 FROM workflow_pauses WHERE workflow_type = :type)',
             ['type' => $workflowType],
         ));
@@ -377,13 +431,13 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             // the advisory lock FIRST, xact-scoped so it dies with the birth's transaction: every
             // concurrent birth of this parent queues here, then counts what the one before it wrote
             $this->connection->executeQuery(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "SELECT pg_advisory_xact_lock(hashtextextended('storm-spawn:' || :parent, 0))",
                 ['parent' => $parentCorrelationId],
             );
 
             return (int) $this->connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT count(*) FROM workflow_instances WHERE parent_correlation_id = :parent',
                 ['parent' => $parentCorrelationId],
             );
@@ -395,10 +449,11 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         // The range is a PREFILTER, not the membership test. Deterministic member identities sort
         // as one contiguous range, `prefix<digits>` lying between `prefix0` and `prefix:` (':' being
         // the character after '9'), which the registry's primary key serves without a LIKE and
-        // without escaping the app-owned correlation id. The bound is read in BYTES, which is what
-        // `correlation_id COLLATE "C"` buys: under a libc locale collation punctuation weighs less
-        // than digits, the upper bound sorts below the members, and the count comes back zero with
-        // nothing to show for it.
+        // without escaping the app-owned correlation id. The bound only holds in BYTES: under a libc
+        // locale collation punctuation weighs less than digits, the upper bound sorts below the
+        // members, and the count comes back zero with nothing to show for it. The column is pinned
+        // to `C` and the comparisons repeat it, so the primary key serves the range on the pinned
+        // column and the count stays right, only slower, on a column whose pin has drifted.
         //
         // What the range CANNOT say is where the digits end, because it only constrains the first
         // character after the prefix: `prefix12abc` opens on a digit and sits inside the bounds like
@@ -409,9 +464,9 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         $prefix = $parentCorrelationId.ChildCorrelation::DELIMITER.$family.'-';
 
         return $this->guard(fn (): int => (int) $this->connection->fetchOne(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             "SELECT count(DISTINCT correlation_id) FROM workflow_correlations
-             WHERE correlation_id >= :lo AND correlation_id < :hi
+             WHERE correlation_id COLLATE \"C\" >= :lo AND correlation_id COLLATE \"C\" < :hi
                AND substring(correlation_id from char_length(:prefix) + 1) ~ '^[0-9]+$'",
             ['lo' => $prefix.'0', 'hi' => $prefix.':', 'prefix' => $prefix],
         ));
@@ -424,10 +479,10 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
         $prefix = $parentCorrelationId.ChildCorrelation::DELIMITER.$family.'-';
 
         return $this->guard(fn (): int => (int) $this->connection->fetchOne(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             "SELECT count(*) FROM workflow_instances
              WHERE parent_correlation_id = :parent AND status = 'running'
-               AND correlation_id >= :lo AND correlation_id < :hi
+               AND correlation_id COLLATE \"C\" >= :lo AND correlation_id COLLATE \"C\" < :hi
                AND substring(correlation_id from char_length(:prefix) + 1) ~ '^[0-9]+$'",
             ['parent' => $parentCorrelationId, 'lo' => $prefix.'0', 'hi' => $prefix.':', 'prefix' => $prefix],
         ));
@@ -439,7 +494,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
             $row = $this->connection->fetchAssociative(
                 // FOR SHARE, never FOR UPDATE: siblings born concurrently must not serialize against
                 // each other, only against the parent's settle, which needs the row exclusively.
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE correlation_id = :corr LIMIT 1 FOR SHARE',
                 ['corr' => $correlationId],
@@ -453,7 +508,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(function () use ($parentCorrelationId): array {
             $rows = $this->connection->fetchAllAssociative(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 "SELECT workflow_type, correlation_id, state_key, status, vars, retries, compensations, context, version, generation, definition_version, state_version, retry_total, retimes, arms, families, parked, started_at, global_deadline_consumed_at, waived_at, paused_at, paused_reason
                  FROM workflow_instances WHERE parent_correlation_id = :parent AND status = 'running' ORDER BY correlation_id",
                 ['parent' => $parentCorrelationId],
@@ -472,7 +527,7 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     public function countTerminal(bool $includeFailed, int $ageSeconds): int
     {
         return $this->guard(fn (): int => (int) $this->connection->fetchOne(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             'SELECT count(*) FROM workflow_instances WHERE '.self::terminalPredicate($includeFailed),
             ['age' => $ageSeconds],
         ));
@@ -499,8 +554,8 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
     {
         return $this->guard(function () use ($includeFailed, $ageSeconds, $batch): int {
             $this->connection->executeStatement(
-                /** @lang PostgreSQL */
                 sprintf(
+                    /* language=PostgreSQL */
                     'UPDATE workflow_correlations c
                      SET closed_at = i.updated_at, final_status = i.status
                      FROM workflow_instances i
@@ -681,13 +736,9 @@ final readonly class DbalWorkflowInstanceStore implements WorkflowInstanceStore
      */
     private static function guardStateSize(WorkflowInstanceRow $row, array $columns): void
     {
-        $sizes = [];
-        $total = 0;
-        foreach (['vars', 'retries', 'compensations', 'context'] as $bag) {
-            $bytes = strlen((string) $columns[$bag]);
-            $sizes[$bag] = $bytes;
-            $total += $bytes;
-        }
+        $bags = ['vars', 'retries', 'compensations', 'context'];
+        $sizes = array_combine($bags, array_map(static fn (string $bag): int => strlen((string) $columns[$bag]), $bags));
+        $total = array_sum($sizes);
 
         if ($total > self::MAX_STATE_BYTES) {
             throw SagaStateTooLarge::forInstance($row->workflowType, $row->correlationId, $total, self::MAX_STATE_BYTES, $sizes);

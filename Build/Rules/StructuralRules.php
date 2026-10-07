@@ -50,10 +50,8 @@ final readonly class StructuralRules
      */
     public function everyStateKeyIsNamed(string $workflow, array $declared): void
     {
-        foreach ($declared as $state) {
-            if (trim($state->key) === '') {
-                throw InvalidWorkflowDefinition::stateKeyBlank($workflow);
-            }
+        if (array_any($declared, static fn (StateAttribute $state): bool => trim($state->key) === '')) {
+            throw InvalidWorkflowDefinition::stateKeyBlank($workflow);
         }
     }
 
@@ -88,10 +86,9 @@ final readonly class StructuralRules
     public function decoratorsTargetActivityStates(string $workflow, array $decoratorsByLabel, array $types): void
     {
         foreach ($decoratorsByLabel as $label => $map) {
-            foreach (array_keys($map) as $stateKey) {
-                if (($types[$stateKey] ?? null) !== StateType::Activity) {
-                    throw InvalidWorkflowDefinition::decoratesNonActivityState($label, (string) $stateKey, $workflow);
-                }
+            $stateKey = array_find_key($map, static fn (mixed $decorator, int|string $stateKey): bool => ($types[$stateKey] ?? null) !== StateType::Activity);
+            if ($stateKey !== null) {
+                throw InvalidWorkflowDefinition::decoratesNonActivityState($label, (string) $stateKey, $workflow);
             }
         }
     }
@@ -106,10 +103,9 @@ final readonly class StructuralRules
      */
     public function waitForTargetsWaitStates(string $workflow, array $waitForKeys, array $types): void
     {
-        foreach ($waitForKeys as $stateKey) {
-            if (($types[$stateKey] ?? null) !== StateType::Wait) {
-                throw InvalidWorkflowDefinition::waitForOnNonWaitState($stateKey, $workflow);
-            }
+        $stateKey = array_find($waitForKeys, static fn (string $stateKey): bool => ($types[$stateKey] ?? null) !== StateType::Wait);
+        if ($stateKey !== null) {
+            throw InvalidWorkflowDefinition::waitForOnNonWaitState($stateKey, $workflow);
         }
     }
 
@@ -171,10 +167,9 @@ final readonly class StructuralRules
      */
     public function onEventRidesAnEventTrigger(string $workflow, array $transitions): void
     {
-        foreach ($transitions as $on) {
-            if ($on->onEvent !== null && $on->trigger !== OnTrigger::Event) {
-                throw InvalidWorkflowDefinition::onEventOnNonEventTrigger($on->from, $on->onEvent, $workflow);
-            }
+        $on = array_find($transitions, static fn (On $on): bool => $on->onEvent !== null && $on->trigger !== OnTrigger::Event);
+        if ($on?->onEvent !== null) {
+            throw InvalidWorkflowDefinition::onEventOnNonEventTrigger($on->from, $on->onEvent, $workflow);
         }
     }
 
@@ -185,10 +180,9 @@ final readonly class StructuralRules
      */
     public function onEventClassesExist(string $workflow, array $transitions): void
     {
-        foreach ($transitions as $on) {
-            if ($on->onEvent !== null && ! class_exists($on->onEvent) && ! interface_exists($on->onEvent)) {
-                throw InvalidWorkflowDefinition::unknownOnEventClass($on->onEvent, $on->from, $workflow);
-            }
+        $on = array_find($transitions, static fn (On $on): bool => $on->onEvent !== null && ! class_exists($on->onEvent) && ! interface_exists($on->onEvent));
+        if ($on?->onEvent !== null) {
+            throw InvalidWorkflowDefinition::unknownOnEventClass($on->onEvent, $on->from, $workflow);
         }
     }
 
@@ -217,13 +211,13 @@ final readonly class StructuralRules
      */
     public function onEventTargetsAConcreteClass(string $workflow, array $transitions): void
     {
-        foreach ($transitions as $on) {
-            if ($on->onEvent === null) {
-                continue;
-            }
-            if (interface_exists($on->onEvent) || new ReflectionClass($on->onEvent)->isAbstract()) {
-                throw InvalidWorkflowDefinition::onEventNotConcrete($on->onEvent, $on->from, $workflow);
-            }
+        $on = array_find(
+            $transitions,
+            static fn (On $on): bool => $on->onEvent !== null
+                && (interface_exists($on->onEvent) || new ReflectionClass($on->onEvent)->isAbstract()),
+        );
+        if ($on?->onEvent !== null) {
+            throw InvalidWorkflowDefinition::onEventNotConcrete($on->onEvent, $on->from, $workflow);
         }
     }
 
@@ -254,9 +248,9 @@ final readonly class StructuralRules
             };
 
             if (! in_array($on->trigger, $legal, true)) {
-                throw array_map(static fn (OnTrigger $trigger): string => $trigger->value, $legal)
-                        |> (static fn ($x) => implode(', ', $x))
-                        |> (static fn ($x) => InvalidWorkflowDefinition::triggerForeignToStateKind($on->trigger->value, $on->from, $kind->value, $x, $workflow));
+                $allowed = implode(', ', array_map(static fn (OnTrigger $trigger): string => $trigger->value, $legal));
+
+                throw InvalidWorkflowDefinition::triggerForeignToStateKind($on->trigger->value, $on->from, $kind->value, $allowed, $workflow);
             }
         }
     }

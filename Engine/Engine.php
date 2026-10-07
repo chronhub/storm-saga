@@ -12,7 +12,6 @@ use Storm\Saga\Child\ParentRef;
 use Storm\Saga\Exception\InvalidChildIdentity;
 use Storm\Saga\Exception\SagaFenceBusy;
 use Storm\Saga\Exception\SagaOutcomeNotYetApplicable;
-use Storm\Saga\Outbox\FailedWorkflowCommands;
 use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstances;
 
@@ -33,7 +32,6 @@ final readonly class Engine implements SagaEngine
         private WorkflowRegistry $registry,
         private StepExecutor $executor,
         private WorkflowInstances $instances,
-        private FailedWorkflowCommands $outbox,
         /**
          * Where a routed outcome that found no instance leaves its line, `storm.saga.outcome_unrouted`
          * at debug with the correlation and the event class, never the payload. Debug because an event
@@ -170,6 +168,21 @@ final readonly class Engine implements SagaEngine
         )->applied();
     }
 
+    public function cancelOrThrow(string $workflowType, string $correlationId, ?string $reason = null, bool $force = false, ?string $causationId = null): bool
+    {
+        $report = $this->executor->execute(
+            $this->registry,
+            new WorkflowId($workflowType, $correlationId),
+            Signal::cancel($reason, $force, $causationId),
+        );
+
+        if ($report === ExecutionReport::FenceBusy) {
+            throw SagaFenceBusy::whileCancelling($workflowType, $correlationId);
+        }
+
+        return $report->applied();
+    }
+
     public function pokeFamily(string $workflowType, string $correlationId, ?string $causationId = null): bool
     {
         return $this->executor->execute(
@@ -177,6 +190,21 @@ final readonly class Engine implements SagaEngine
             new WorkflowId($workflowType, $correlationId),
             Signal::familyPoke($causationId),
         )->applied();
+    }
+
+    public function pokeFamilyOrThrow(string $workflowType, string $correlationId, ?string $causationId = null): bool
+    {
+        $report = $this->executor->execute(
+            $this->registry,
+            new WorkflowId($workflowType, $correlationId),
+            Signal::familyPoke($causationId),
+        );
+
+        if ($report === ExecutionReport::FenceBusy) {
+            throw SagaFenceBusy::whilePokingFamily($workflowType, $correlationId);
+        }
+
+        return $report->applied();
     }
 
     public function deliverByCorrelation(string $correlationId, object $event, ?string $causationId = null): bool
@@ -234,20 +262,17 @@ final readonly class Engine implements SagaEngine
 
     public function failIssuedEffect(string $correlationId, ?string $causationId = null, ?string $failedMessageId = null): ExecutionReport
     {
-        $row = $this->instances->findByCorrelation($correlationId);
-        if ($row === null) {
+        // the type alone: the pairing input, WHICH command died and whether it is still dead, is read
+        // by the step under its fence against the generation it loads, never here
+        $id = $this->instances->idByCorrelation($correlationId);
+        if ($id === null) {
             return ExecutionReport::NothingToDo;
         }
 
-        // the pairing input, read pre-fence like the row resolution above: WHICH command died, issued by
-        // which state, with living same-step siblings or not. Unknown, whether no id, unknown row, or
-        // pre-upgrade rows, stays null; the policy treats unpaired as escalate-only, never as a settle.
-        $provenance = $failedMessageId === null ? null : $this->outbox->provenance($correlationId, $failedMessageId, $row->generation);
-
         return $this->executor->execute(
             $this->registry,
-            new WorkflowId($row->workflowType, $row->correlationId),
-            Signal::effectFailure($causationId, $failedMessageId, $provenance),
+            $id,
+            Signal::effectFailure($causationId, $failedMessageId),
         );
     }
 

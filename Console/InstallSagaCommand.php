@@ -227,7 +227,7 @@ final class InstallSagaCommand extends Command
     {
         /** @var array{db: string, schema: string, version: string, version_num: int|string} $row */
         $row = $this->connection->fetchAssociative(
-            /** @lang PostgreSQL */
+            /* language=PostgreSQL */
             "SELECT current_database() AS db, current_schema() AS schema,
                     current_setting('server_version') AS version,
                     current_setting('server_version_num')::int AS version_num",
@@ -243,7 +243,7 @@ final class InstallSagaCommand extends Command
     {
         try {
             return (int) $this->connection->fetchOne(
-                /** @lang PostgreSQL */
+                /* language=PostgreSQL */
                 'SELECT count(*) FROM workflow_instances WHERE status = :status',
                 ['status' => WorkflowStatus::Running->value],
             );

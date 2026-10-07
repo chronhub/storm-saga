@@ -11,6 +11,7 @@ use Storm\Saga\Exception\MissingAsyncTimeout;
 use Storm\Saga\Exception\SagaFenceBusy;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
 use Throwable;
@@ -37,6 +38,7 @@ interface SagaStarter
      * @throws WorkflowNotFound when no workflow is registered under `$workflowType`
      * @throws WorkflowStepLimitExceeded when the start's synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a timer's fire instant cannot be derived
      * @throws SerializationExceptionContract when an issued command is not a serializable payload
@@ -63,6 +65,7 @@ interface SagaStarter
      * @throws WorkflowNotFound when no workflow is registered under `$workflowType`
      * @throws WorkflowStepLimitExceeded when the start's synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a timer's fire instant cannot be derived
      * @throws SerializationExceptionContract when an issued command is not a serializable payload

@@ -45,21 +45,22 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
         if ($businessDays === []) {
             throw InvalidBusinessCalendar::emptyBusinessDays();
         }
-        foreach ($businessDays as $day) {
-            if ($day < 1 || $day > 7) {
-                throw InvalidBusinessCalendar::dayOutOfRange($day);
-            }
+        $invalidDay = array_find($businessDays, static fn (int $day): bool => $day < 1 || $day > 7);
+        if ($invalidDay !== null) {
+            throw InvalidBusinessCalendar::dayOutOfRange($invalidDay);
         }
         if ($openHour < 0 || $openHour >= $closeHour || $closeHour > 24) {
             throw InvalidBusinessCalendar::hoursWindowInvalid($openHour, $closeHour);
         }
-        foreach ($holidays as $holiday) {
+        $malformedHoliday = array_find(
+            $holidays,
             // equivalent mutant: the year index $m[1] to $m[0]; the full match starts with the year,
             // so (int) of either yields the same number; the capture is kept for intent, not behavior
-            if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $holiday, $m) !== 1
-                || ! checkdate((int) $m[2], (int) $m[3], (int) $m[1])) {
-                throw InvalidBusinessCalendar::malformedHoliday($holiday);
-            }
+            static fn (string $holiday): bool => preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $holiday, $m) !== 1
+                || ! checkdate((int) $m[2], (int) $m[3], (int) $m[1]),
+        );
+        if ($malformedHoliday !== null) {
+            throw InvalidBusinessCalendar::malformedHoliday($malformedHoliday);
         }
 
         $this->timezone = is_string($timezone) ? new DateTimeZone($timezone) : $timezone;
@@ -95,6 +96,9 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
 
     private function isBusinessDay(DateTimeImmutable $local): bool
     {
+        // a mutant making every day a non-business day spins the day walks below forever: a test of
+        // isBusinessTime() kills it at once, a test of advance() times it out, and the order Infection
+        // runs them in decides which, so these mutants flap between killed and timed out
         return in_array((int) $local->format('N'), $this->businessDays, true)
             && ! in_array($local->format('Y-m-d'), $this->holidays, true);
     }
@@ -116,6 +120,8 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
      */
     private function addBusinessDays(DateTimeImmutable $cursor, int $n): DateTimeImmutable
     {
+        // an inverted bound loops forever on zero days and exits at once otherwise, so its mutant is
+        // killed or timed out by whichever covering test runs first
         for ($i = 0; $i < $n; $i++) {
             $cursor = $cursor->modify('+1 day');
             while (! $this->isBusinessDay($cursor)) {
@@ -143,6 +149,9 @@ final readonly class ConfiguredBusinessCalendar implements BusinessCalendar
 
         while (true) {
             $close = $cursor->setTime($this->closeHour, 0);
+            // 'u' is always six digits and the subtraction reads a numeric string as its integer, so
+            // dropping the cast is an equivalent mutant; the gate's configuration leaves out this
+            // method's only CastInt, where a pin would mask the killed arithmetic of the statement
             $remainingToClose = ($close->getTimestamp() - $cursor->getTimestamp()) * 1_000_000
                 - (int) $cursor->format('u');
 

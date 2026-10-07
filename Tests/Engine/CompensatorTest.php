@@ -12,12 +12,15 @@ use Storm\Clock\PointInTime;
 use Storm\Saga\Attributes\OnTrigger;
 use Storm\Saga\Engine\Compensator;
 use Storm\Saga\Engine\IssuedCommand;
+use Storm\Saga\Engine\RecallVerdict;
 use Storm\Saga\Engine\Run\Rested;
+use Storm\Saga\Engine\TimerOp;
 use Storm\Saga\Engine\Verdict\Transition;
 use Storm\Saga\Event\CompensationFailed;
 use Storm\Saga\Event\SagaCompensated;
 use Storm\Saga\Event\SagaCompensationSkipped;
 use Storm\Saga\Event\SagaHalted;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Tests\Fixture\MutableClock;
@@ -81,7 +84,7 @@ final class CompensatorTest extends TestCase
     {
         $running = new Rested($this->row(WorkflowStatus::Running, []));
 
-        $this->assertSame($running, $this->compensator()->maybeCompensate($this->def(), $running, null));
+        $this->assertSame($running, $this->compensator()->maybeCompensate($this->def(), $running, null, RecallVerdict::none()));
     }
 
     #[Test]
@@ -89,7 +92,7 @@ final class CompensatorTest extends TestCase
     {
         $halted = new Rested($this->row(WorkflowStatus::Halted, []));
 
-        $this->assertSame($halted, $this->compensator()->maybeCompensate($this->def(), $halted, null));
+        $this->assertSame($halted, $this->compensator()->maybeCompensate($this->def(), $halted, null, RecallVerdict::none()));
     }
 
     #[Test]
@@ -97,7 +100,7 @@ final class CompensatorTest extends TestCase
     {
         $halted = new Rested($this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge')->confirm()]));
 
-        $result = $this->compensator()->maybeCompensate($this->def(), $halted, null);
+        $result = $this->compensator()->maybeCompensate($this->def(), $halted, null, RecallVerdict::none());
 
         $this->assertNotSame($halted, $result);
         $this->assertSame(WorkflowStatus::Compensated, $result->row->status);
@@ -287,7 +290,7 @@ final class CompensatorTest extends TestCase
     {
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge')->confirm()]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: true);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: true, recalled: RecallVerdict::none());
 
         $this->assertSame(WorkflowStatus::Compensated, $result->row->status);
         $this->assertSame(CompensationStatus::Compensated, $result->row->compensations[0]->status);
@@ -299,7 +302,7 @@ final class CompensatorTest extends TestCase
         // locationAgnostic at a global deadline: an unconfirmed step's effect is unverifiable, so skipped, not undone
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge')]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: true);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: true, recalled: RecallVerdict::none());
 
         $this->assertSame(WorkflowStatus::Halted, $result->row->status); // nothing ran, dead end
         $this->assertSame(CompensationStatus::Skipped, $result->row->compensations[0]->status);
@@ -319,7 +322,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('ship')->confirm(),
         ]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $compensated = $this->of($result->announcements, SagaCompensated::class);
         $this->assertCount(1, $compensated);
@@ -337,7 +340,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('audit'),
         ]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Compensated, $result->row->compensations[0]->status);
         $this->assertSame(CompensationStatus::Pending, $result->row->compensations[1]->status);
@@ -352,7 +355,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('ship'),
         ]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Skipped, $result->row->compensations[1]->status);
         $this->assertSame(CompensationStatus::Compensated, $result->row->compensations[0]->status);
@@ -364,7 +367,7 @@ final class CompensatorTest extends TestCase
         // a halt is positional: maybeCompensate must undo an untracked step, though location-agnostic would skip it
         $halted = new Rested($this->row(WorkflowStatus::Halted, [CompensationRecord::pending('refund')]));
 
-        $result = $this->compensator()->maybeCompensate($this->def(), $halted, null);
+        $result = $this->compensator()->maybeCompensate($this->def(), $halted, null, RecallVerdict::none());
 
         $this->assertSame(WorkflowStatus::Compensated, $result->row->status);
     }
@@ -376,7 +379,7 @@ final class CompensatorTest extends TestCase
         $def = $this->def(chargeUndo: $undo);
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge', degraded: true)->confirm()]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Skipped, $result->row->compensations[0]->status);
         $this->assertSame('degraded — fallback result, undo may not match', $result->row->compensations[0]->reason);
@@ -388,7 +391,7 @@ final class CompensatorTest extends TestCase
     {
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge')]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Skipped, $result->row->compensations[0]->status);
         $this->assertSame('unconfirmed', $result->row->compensations[0]->reason);
@@ -399,7 +402,7 @@ final class CompensatorTest extends TestCase
     {
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('refund')]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: true);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: true, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Skipped, $result->row->compensations[0]->status);
         $this->assertSame('unverifiable at global deadline', $result->row->compensations[0]->reason);
@@ -411,10 +414,57 @@ final class CompensatorTest extends TestCase
         // positional: progression past `refund` implies its effect happened; untracked still undoes
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('refund')]);
 
-        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(WorkflowStatus::Compensated, $result->row->status);
         $this->assertSame(CompensationStatus::Compensated, $result->row->compensations[0]->status);
+    }
+
+    #[Test]
+    public function a_recalled_verdict_settles_the_entry_skipped_before_any_undo_runs(): void
+    {
+        // the untracked `refund` a positional halt would undo, whose forward command the recall proved
+        // never left: nothing happened, so its undo never runs, while an unrelated command still rides
+        $refundUndo = new RecordingActivity(ActivityResult::success(commands: [new stdClass]));
+        $entry = CompensationRecord::pending('refund');
+        $halted = $this->row(WorkflowStatus::Halted, [$entry]);
+        $owedCommand = new IssuedCommand('audit', new stdClass, CommandPurpose::Forward);
+
+        $result = $this->compensator()->compensate($this->def(refundUndo: $refundUndo), $halted, new Rested($halted, commands: [$owedCommand]), null, locationAgnostic: false, recalled: RecallVerdict::of($entry));
+
+        $this->assertSame(0, $refundUndo->calls);
+        $this->assertSame(CompensationStatus::Skipped, $result->row->compensations[0]->status);
+        $this->assertSame('recalled: never dispatched', $result->row->compensations[0]->reason);
+        $this->assertSame([$owedCommand], $result->commands);
+        $this->assertSame(WorkflowStatus::Halted, $result->row->status);
+    }
+
+    #[Test]
+    public function a_recalled_entry_is_announced_among_the_skipped(): void
+    {
+        $entry = CompensationRecord::pending('refund');
+        $halted = $this->row(WorkflowStatus::Halted, [$entry]);
+
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::of($entry));
+
+        $skipped = $this->of($result->announcements, SagaCompensationSkipped::class);
+        $this->assertCount(1, $skipped);
+        $this->assertSame(['refund'], $skipped[0]->states);
+        $this->assertCount(0, $this->of($result->announcements, SagaCompensated::class));
+        $this->assertCount(1, $this->of($result->announcements, SagaHalted::class));
+    }
+
+    #[Test]
+    public function a_rollback_keeps_the_timer_ops_of_the_run_it_carries(): void
+    {
+        // a halt in the step that crossed a timed wait carries that wait's cancel: the rollback must hand
+        // it on, or the wait's timer outlives the settled saga and fires into a run that is over
+        $cancel = TimerOp::cancelState('await_x');
+        $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge')->confirm()]);
+
+        $result = $this->compensator()->compensate($this->def(), $halted, new Rested($halted, timerOps: [$cancel]), null, locationAgnostic: false, recalled: RecallVerdict::none());
+
+        $this->assertSame([$cancel], $result->timerOps);
     }
 
     #[Test]
@@ -422,16 +472,17 @@ final class CompensatorTest extends TestCase
     {
         // the undo of a command-driven step is itself a durable command: issued ones append to the carried,
         // wrapped with the compensated step as provenance, the rollback's own pairing trace
-        $seeded = new IssuedCommand('earlier', new stdClass);
+        $seeded = new IssuedCommand('earlier', new stdClass, CommandPurpose::Forward);
         $issued = new stdClass;
         $def = $this->def(chargeUndo: new RecordingActivity(ActivityResult::success(commands: [$issued])));
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('charge')->confirm()]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted, commands: [$seeded]), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted, commands: [$seeded]), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame($seeded, $result->commands[0]);
         $this->assertSame('charge', $result->commands[1]->fromState);
         $this->assertSame($issued, $result->commands[1]->command);
+        $this->assertSame(CommandPurpose::Compensation, $result->commands[1]->purpose); // what keeps an abort's recall off the undo
     }
 
     #[Test]
@@ -444,7 +495,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('ship')->confirm(), // undone FIRST in reverse, and it fails
         ]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Failed, $result->row->compensations[1]->status);
         $this->assertSame(CompensationStatus::Pending, $result->row->compensations[0]->status); // left for reconciliation
@@ -462,7 +513,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('ship')->confirm(),
         ]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Failed, $result->row->compensations[1]->status); // flagged, not fatal
         $this->assertSame('boom', $result->row->compensations[1]->reason); // the undo's own error surfaces
@@ -480,7 +531,7 @@ final class CompensatorTest extends TestCase
         $def = $this->def(chargeUndo: new RecordingActivity(ActivityResult::success()), shipUndo: $shipUndo);
         $halted = $this->row(WorkflowStatus::Halted, [CompensationRecord::pending('ship')->confirm()]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Failed, $result->row->compensations[0]->status);
         $this->assertSame('RuntimeException: the gateway exploded', $result->row->compensations[0]->reason); // the throwable surfaces as its audit digest
@@ -501,7 +552,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('ship')->confirm(),
         ]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Failed, $result->row->compensations[1]->status); // ship, the thrower
         $this->assertSame(CompensationStatus::Pending, $result->row->compensations[0]->status); // charge, left for reconciliation
@@ -519,7 +570,7 @@ final class CompensatorTest extends TestCase
             CompensationRecord::pending('ship')->confirm(),
         ]);
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Failed, $result->row->compensations[1]->status); // ship, flagged, not fatal
         $this->assertSame(CompensationStatus::Compensated, $result->row->compensations[0]->status); // charge, ran anyway
@@ -556,7 +607,7 @@ final class CompensatorTest extends TestCase
             ]
         );
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(1, $provisionUndo->calls, 'Join arm "provision" compensation must be called');
         $this->assertSame(1, $chargeUndo->calls, 'Join arm "charge" compensation must be called');
@@ -585,7 +636,7 @@ final class CompensatorTest extends TestCase
             [CompensationRecord::forArm('race_state', 'fast', CompensationStatus::Pending, true)]
         );
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(1, $fastUndo->calls);
         $this->assertSame(CompensationStatus::Compensated, $result->row->compensations[0]->status);
@@ -610,7 +661,7 @@ final class CompensatorTest extends TestCase
             [CompensationRecord::forArm('parallel_setup', 'unknown_ghost_arm', CompensationStatus::Pending, true)]
         );
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: false, recalled: RecallVerdict::none());
 
         $this->assertSame(CompensationStatus::Pending, $result->row->compensations[0]->status);
     }
@@ -645,7 +696,7 @@ final class CompensatorTest extends TestCase
             ]
         );
 
-        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: true);
+        $result = $this->compensator()->compensate($def, $halted, new Rested($halted), null, locationAgnostic: true, recalled: RecallVerdict::none());
 
         $this->assertSame(0, $joinUndo->calls);
         $this->assertSame(0, $raceUndo->calls);
@@ -666,7 +717,7 @@ final class CompensatorTest extends TestCase
      * - `audit`: no compensation
      * - `refund`: undo, untracked.
      */
-    private function def(CompensationMode $mode = CompensationMode::BestEffort, ?Activity $chargeUndo = null, ?Activity $shipUndo = null): WorkflowDefinition
+    private function def(CompensationMode $mode = CompensationMode::BestEffort, ?Activity $chargeUndo = null, ?Activity $shipUndo = null, ?Activity $refundUndo = null): WorkflowDefinition
     {
         $forward = static fn (): RecordingActivity => new RecordingActivity(ActivityResult::success());
 
@@ -675,7 +726,7 @@ final class CompensatorTest extends TestCase
             'ship' => new ActivityState('ship', $forward(), compensation: $shipUndo ?? $forward(), compensationConfirmedBy: SampleEvent::class),
             'settle' => new ActivityState('settle', $forward(), compensation: $forward(), compensationConfirmedBy: SettlementContract::class),
             'audit' => new ActivityState('audit', $forward()),
-            'refund' => new ActivityState('refund', $forward(), compensation: $forward()),
+            'refund' => new ActivityState('refund', $forward(), compensation: $refundUndo ?? $forward()),
             'await_x' => new WaitState('await_x'),
         ];
 

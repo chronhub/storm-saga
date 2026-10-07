@@ -71,4 +71,33 @@ final class StepEffectsTest extends TestCase
         self::assertSame([['stateKey' => '__global__', 'keepKinds' => []]], $once->cancels);
         self::assertFalse($once->isEmpty());
     }
+
+    #[Test]
+    public function a_schedule_arm_and_a_global_cancel_fold_like_their_kinds(): void
+    {
+        // every operation kind folds: a schedule arms a schedule timer, and the global cancel is a
+        // cancel like the state one, never an operation the fold does not know
+        $at = FrozenClock::at('2026-09-16T12:00:00.000000+00:00')->now();
+        $global = TimerOp::cancelGlobal();
+
+        $effects = StepEffects::fold([
+            ['op' => TimerOp::armScheduleAt('tick', $at), 'fireAt' => $at],
+            ['op' => $global, 'fireAt' => $at],
+        ]);
+
+        self::assertSame([['stateKey' => $global->stateKey, 'keepKinds' => []]], $effects->cancels);
+        self::assertSame([['stateKey' => 'tick', 'kind' => TimerKind::Schedule, 'fireAt' => $at]], $effects->arms);
+    }
+
+    #[Test]
+    public function with_cancel_keeps_the_cancels_the_fold_already_holds(): void
+    {
+        $at = FrozenClock::at('2026-09-16T12:00:00.000000+00:00')->now();
+        $effects = StepEffects::fold([['op' => TimerOp::cancelState('await'), 'fireAt' => $at]]);
+
+        self::assertSame([
+            ['stateKey' => 'await', 'keepKinds' => []],
+            ['stateKey' => '__global__', 'keepKinds' => []],
+        ], $effects->withCancel('__global__')->cancels);
+    }
 }

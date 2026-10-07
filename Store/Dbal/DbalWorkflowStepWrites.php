@@ -23,8 +23,8 @@ use Storm\Serializer\MessageSerializer;
  * One server statement per step. The OCC update is the root branch, and every other branch depends
  * on its returned row through an EXISTS, so a version that moved updates nothing, cancels nothing,
  * arms nothing and issues nothing, the count the statement returns then being zero. The branches key
- * their own rows by the bound id rather than by the root's columns: the instance's correlation is
- * pinned to another collation, and a join on it would lose the timer index. No row is touched twice inside the statement: the effects come
+ * their own rows by the bound id rather than by the root's columns, their dependency on the root
+ * branch being the EXISTS alone. No row is touched twice inside the statement: the effects come
  * folded, a cancel sparing the kinds the same step re-arms, so the delete and the upsert on
  * `workflow_timers` never meet on one row; a data-modifying `WITH` guarantees nothing about the order
  * of its branches, and this shape needs none.
@@ -96,9 +96,8 @@ final readonly class DbalWorkflowStepWrites implements WorkflowStepWrites
                 }
                 $keys[] = '('.$clause.')';
             }
-            // keyed by the bound id, never through the CTE's columns: a join on `upd` loses the unique
-            // index, the instance's correlation being pinned to another collation, and scans the
-            // workflow's whole timer set; the dependency on the root branch is the EXISTS
+            // keyed by the bound id, never through the CTE's columns: the dependency on the root
+            // branch is the EXISTS
             $branches[] = 'cancelled AS (
                 DELETE FROM workflow_timers t
                 WHERE t.workflow_type = :type AND t.correlation_id = :corr
@@ -132,15 +131,16 @@ final readonly class DbalWorkflowStepWrites implements WorkflowStepWrites
                 $params["o{$i}s"] = $entry->issuedFromState;
                 $params["o{$i}v"] = $entry->issuedAtVersion;
                 $params["o{$i}g"] = $entry->generation;
+                $params["o{$i}p"] = $entry->purpose->value;
                 $params["o{$i}e"] = $entry->effectGroup;
                 $types["o{$i}v"] = ParameterType::INTEGER;
                 $types["o{$i}g"] = ParameterType::INTEGER;
-                $rows[] = "(CAST(:o{$i}b AS text), CAST(:o{$i}h AS jsonb), CAST(:o{$i}c AS jsonb), CAST(:o{$i}s AS text), CAST(:o{$i}v AS integer), CAST(:o{$i}g AS integer), CAST(:o{$i}e AS text))";
+                $rows[] = "(CAST(:o{$i}b AS text), CAST(:o{$i}h AS jsonb), CAST(:o{$i}c AS jsonb), CAST(:o{$i}s AS text), CAST(:o{$i}v AS integer), CAST(:o{$i}g AS integer), CAST(:o{$i}p AS text), CAST(:o{$i}e AS text))";
             }
             $branches[] = 'issued AS (
-                INSERT INTO workflow_outbox (workflow_type, correlation_id, bus, header, content, issued_from_state, issued_at_version, generation, effect_group)
-                SELECT CAST(:type AS text), CAST(:corr AS text), v.bus, v.header, v.content, v.from_state, v.at_version, v.generation, v.effect_group
-                FROM (VALUES '.implode(', ', $rows).') AS v(bus, header, content, from_state, at_version, generation, effect_group)
+                INSERT INTO workflow_outbox (workflow_type, correlation_id, bus, header, content, issued_from_state, issued_at_version, generation, purpose, effect_group)
+                SELECT CAST(:type AS text), CAST(:corr AS text), v.bus, v.header, v.content, v.from_state, v.at_version, v.generation, v.purpose, v.effect_group
+                FROM (VALUES '.implode(', ', $rows).') AS v(bus, header, content, from_state, at_version, generation, purpose, effect_group)
                 WHERE EXISTS (SELECT 1 FROM upd))';
         }
 

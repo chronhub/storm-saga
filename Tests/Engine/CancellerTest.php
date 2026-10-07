@@ -14,9 +14,11 @@ use Storm\Saga\Engine\Canceller;
 use Storm\Saga\Engine\Compensator;
 use Storm\Saga\Event\SagaCancelled;
 use Storm\Saga\Event\SagaCompensated;
+use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
 use Storm\Saga\Tests\Fixture\MutableClock;
+use Storm\Saga\Tests\Fixture\RecallOutbox;
 use Storm\Saga\Tests\Fixture\RecordingActivity;
 use Storm\Saga\Tests\Fixture\SampleEvent;
 use Storm\Saga\Workflow\ActivityResult;
@@ -29,8 +31,8 @@ use Storm\Saga\Workflow\WaitState;
 use Storm\Saga\Workflow\WorkflowDefinition;
 
 /**
- * The operator's cancel: halt where the saga sits, roll back POSITIONALLY, since progression proves
- * completion, and `SagaCancelled(reason)` announced FIRST. Invariant 4 is the safety net: even
+ * The operator's cancel: halt where the saga sits, roll back POSITIONALLY, save a step whose commands
+ * the recall proves never left, and `SagaCancelled(reason)` announced FIRST. Invariant 4 is the safety net: even
  * under `--force`, an unconfirmed tracked step is skipped+flagged, never blindly compensated.
  */
 final class CancellerTest extends TestCase
@@ -82,6 +84,24 @@ final class CancellerTest extends TestCase
     }
 
     #[Test]
+    public function a_step_whose_command_never_left_is_skipped_not_undone(): void
+    {
+        // the untracked 'fee' the positional rollback would undo, but its one forward command is still
+        // pending and no relay ever claimed it: nothing left, so there is nothing to undo
+        $outbox = new RecallOutbox;
+        $outbox->issue(new WorkflowId('wf', 'c-1'), 'fee', 'm-fee');
+        $undo = new RecordingActivity(ActivityResult::success());
+        $row = $this->row('lobby', log: [CompensationRecord::pending('fee')]);
+
+        $run = $this->canceller($outbox)->cancel($this->defWithUntrackedFee($undo), $row, null, null);
+
+        $this->assertSame(0, $undo->calls);
+        $this->assertSame(CompensationStatus::Skipped, $run->row->compensations[0]->status);
+        $this->assertSame('recalled: never dispatched', $run->row->compensations[0]->reason);
+        $this->assertSame(WorkflowStatus::Halted, $run->row->status);
+    }
+
+    #[Test]
     public function with_nothing_to_undo_it_halts_where_it_sat(): void
     {
         $run = $this->canceller()->cancel($this->def(), $this->row('lobby'), null, null);
@@ -92,9 +112,9 @@ final class CancellerTest extends TestCase
         $this->assertNull($run->announcements[0]->reason); // the reason is optional
     }
 
-    private function canceller(): Canceller
+    private function canceller(?RecallOutbox $outbox = null): Canceller
     {
-        return new Canceller(new Compensator(new MutableClock));
+        return new Canceller(new Compensator(new MutableClock), ($outbox ?? new RecallOutbox)->judge());
     }
 
     private function def(): WorkflowDefinition
@@ -123,12 +143,12 @@ final class CancellerTest extends TestCase
         ], 'charge');
     }
 
-    private function defWithUntrackedFee(): WorkflowDefinition
+    private function defWithUntrackedFee(?RecordingActivity $undo = null): WorkflowDefinition
     {
         $fee = new ActivityState(
             'fee',
             new RecordingActivity(ActivityResult::success()),
-            compensation: new RecordingActivity(ActivityResult::success()),
+            compensation: $undo ?? new RecordingActivity(ActivityResult::success()),
             transitions: [new Transition(OnTrigger::Success, 'lobby')],
         );
 

@@ -6,6 +6,7 @@ namespace Storm\Saga\Engine;
 
 use Storm\Contracts\Clock\ClockExceptionContract;
 use Storm\Contracts\Serializer\SerializationExceptionContract;
+use Storm\Saga\Exception\SagaFenceBusy;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Exception\WorkflowNotFound;
@@ -35,6 +36,22 @@ interface SagaOperator
      * @throws Throwable when any other exception is thrown by the cancel step's compensation
      */
     public function cancel(string $workflowType, string $correlationId, ?string $reason = null, bool $force = false, ?string $causationId = null): bool;
+
+    /**
+     * Cancel through the delivery boundary: a held fence requests redelivery instead of returning `false`.
+     *
+     * Other outcomes retain the `cancel()` contract.
+     *
+     * @throws SagaFenceBusy when a concurrent step holds the saga's fence; retry the delivery
+     * @throws WorkflowNotFound when no workflow is registered under `$workflowType`
+     * @throws WorkflowVersionNotFound when the instance's pinned version was purged while it still runs
+     * @throws StaleWorkflowInstance when the OCC update loses to a competing step
+     * @throws ClockExceptionContract when a compensation timestamp cannot be derived
+     * @throws SerializationExceptionContract when a compensation's issued command is not a serializable payload
+     * @throws SagaStorageFailure when the saga storage fails, with driver failures wrapped by the adapter
+     * @throws Throwable when any other exception is thrown by the cancel step's compensation
+     */
+    public function cancelOrThrow(string $workflowType, string $correlationId, ?string $reason = null, bool $force = false, ?string $causationId = null): bool;
 
     /**
      * Signal that a saga-issued command was dead-lettered, either because consumer poison exhausted

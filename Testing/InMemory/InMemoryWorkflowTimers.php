@@ -31,19 +31,19 @@ final readonly class InMemoryWorkflowTimers implements WorkflowTimerStore
 
     public function arm(WorkflowId $id, string $stateKey, TimerKind $kind, PointInTime $fireAt): void
     {
-        foreach ($this->state->timers as $timerId => $timer) {
-            if ($timer['workflowType'] === $id->workflowType && $timer['correlationId'] === $id->correlationId
-                && $timer['stateKey'] === $stateKey && $timer['kind'] === $kind->value) {
-                $reset = $timer;
-                $reset['fireAt'] = $fireAt->toString();
-                $reset['claimedAt'] = null;
-                $reset['attempts'] = 0;
-                $reset['parkedAt'] = null;
-                $reset['lastError'] = null;
-                $this->state->timers[$timerId] = $reset;
+        $timerId = array_find_key($this->state->timers, static fn (array $timer): bool => $timer['workflowType'] === $id->workflowType
+            && $timer['correlationId'] === $id->correlationId
+            && $timer['stateKey'] === $stateKey && $timer['kind'] === $kind->value);
+        if ($timerId !== null) {
+            $reset = $this->state->timers[$timerId];
+            $reset['fireAt'] = $fireAt->toString();
+            $reset['claimedAt'] = null;
+            $reset['attempts'] = 0;
+            $reset['parkedAt'] = null;
+            $reset['lastError'] = null;
+            $this->state->timers[$timerId] = $reset;
 
-                return;
-            }
+            return;
         }
 
         $timerId = $this->state->nextTimerId++;
@@ -103,14 +103,11 @@ final readonly class InMemoryWorkflowTimers implements WorkflowTimerStore
 
     public function fireAt(WorkflowId $id, string $stateKey, TimerKind $kind): ?PointInTime
     {
-        foreach ($this->state->timers as $timer) {
-            if ($timer['workflowType'] === $id->workflowType && $timer['correlationId'] === $id->correlationId
-                && $timer['stateKey'] === $stateKey && $timer['kind'] === $kind->value) {
-                return PointInTime::fromStorage($timer['fireAt']);
-            }
-        }
+        $timer = array_find($this->state->timers, static fn (array $timer): bool => $timer['workflowType'] === $id->workflowType
+            && $timer['correlationId'] === $id->correlationId
+            && $timer['stateKey'] === $stateKey && $timer['kind'] === $kind->value);
 
-        return null;
+        return $timer === null ? null : PointInTime::fromStorage($timer['fireAt']);
     }
 
     public function claimDue(int $limit, PointInTime $now, int $leaseSeconds = 300): array
@@ -120,21 +117,11 @@ final readonly class InMemoryWorkflowTimers implements WorkflowTimerStore
         $leaseFloor = max(1, $leaseSeconds);
         $leaseCutoff = $now->subSeconds($leaseFloor)->toString();
 
-        $due = [];
-        foreach ($this->state->timers as $timer) {
-            if ($timer['fireAt'] > $nowStr || $timer['parkedAt'] !== null) {
-                continue;
-            }
-            if ($timer['claimedAt'] !== null && $timer['claimedAt'] > $leaseCutoff) {
-                continue;
-            }
+        $due = array_filter($this->state->timers, fn (array $timer): bool => $timer['fireAt'] <= $nowStr && $timer['parkedAt'] === null
+            && ($timer['claimedAt'] === null || $timer['claimedAt'] <= $leaseCutoff)
             // the operator freeze: state timers of a paused saga stay due at their original
             // instants; the global deadline claims through, the hard cap is not negotiable
-            if ($timer['kind'] !== TimerKind::Global->value && $this->frozen($timer['workflowType'], $timer['correlationId'])) {
-                continue;
-            }
-            $due[] = $timer;
-        }
+            && ($timer['kind'] === TimerKind::Global->value || ! $this->frozen($timer['workflowType'], $timer['correlationId'])));
 
         usort($due, static fn (array $a, array $b): int => [$a['fireAt'], $a['id']] <=> [$b['fireAt'], $b['id']]);
         $claimed = array_slice($due, 0, $limit);
@@ -160,20 +147,19 @@ final readonly class InMemoryWorkflowTimers implements WorkflowTimerStore
 
     public function cancel(WorkflowId $id, string $stateKey): void
     {
-        foreach ($this->state->timers as $timerId => $timer) {
-            if ($timer['workflowType'] === $id->workflowType && $timer['correlationId'] === $id->correlationId && $timer['stateKey'] === $stateKey) {
-                unset($this->state->timers[$timerId]);
-            }
-        }
+        $this->state->timers = array_filter(
+            $this->state->timers,
+            static fn (array $timer): bool => ! ($timer['workflowType'] === $id->workflowType && $timer['correlationId'] === $id->correlationId && $timer['stateKey'] === $stateKey),
+        );
     }
 
     public function listFor(WorkflowId $id): array
     {
         // @infection-ignore-all; equivalent: usort below reindexes, the values wrap only tidies the interim shape
-        $matching = array_values(array_filter(
+        $matching = array_filter(
             $this->state->timers,
             static fn (array $timer): bool => $timer['workflowType'] === $id->workflowType && $timer['correlationId'] === $id->correlationId,
-        ));
+        ) |> array_values(...);
         usort($matching, static fn (array $a, array $b): int => [$a['fireAt'], $a['id']] <=> [$b['fireAt'], $b['id']]);
 
         return array_map(

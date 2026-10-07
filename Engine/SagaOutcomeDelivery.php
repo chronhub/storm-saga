@@ -12,6 +12,7 @@ use Storm\Saga\Exception\SagaOutcomeNotYetApplicable;
 use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\StaleWorkflowInstance;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
@@ -32,6 +33,7 @@ interface SagaOutcomeDelivery
      * @throws StaleWorkflowInstance when the OCC update loses to a competing step
      * @throws WorkflowStepLimitExceeded when the synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a timer's fire instant cannot be derived
      * @throws SerializationExceptionContract when an issued command is not a serializable payload
@@ -59,6 +61,7 @@ interface SagaOutcomeDelivery
      * @throws StaleWorkflowInstance when the OCC update loses to a competing step
      * @throws WorkflowStepLimitExceeded when the synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a timer's fire instant cannot be derived
      * @throws SerializationExceptionContract when an issued command is not a serializable payload
@@ -88,6 +91,7 @@ interface SagaOutcomeDelivery
      * @throws StaleWorkflowInstance when the OCC update loses to a competing step
      * @throws WorkflowStepLimitExceeded when the synchronous transition chain cycles
      * @throws UnknownState when a transition targets an undeclared state
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws ClockExceptionContract when a timer's fire instant cannot be derived
      * @throws SerializationExceptionContract when an issued command is not a serializable payload

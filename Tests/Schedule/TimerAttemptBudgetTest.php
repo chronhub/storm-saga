@@ -12,6 +12,7 @@ use RuntimeException;
 use Storm\Clock\PointInTime;
 use Storm\Contracts\Clock\Clock;
 use Storm\Saga\Engine\SagaTimerTarget;
+use Storm\Saga\Exception\SagaAnnouncementFailed;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
 use Storm\Saga\Schedule\TimerRunner;
@@ -213,6 +214,34 @@ final class TimerAttemptBudgetTest extends TestCase
         $short = $this->createStub(DueTimerQueue::class);
         $short->method('claimDue')->willReturn([$this->row(TimerKind::Timeout, 1)]);
         $this->assertFalse(new TimerRunner($short, $engine, $clock)->tick(batch: 2)->moreDue);
+    }
+
+    #[Test]
+    #[Group('adversarial')]
+    public function a_listener_failure_after_the_step_leaves_the_timer_alone_and_propagates(): void
+    {
+        // the step already committed, timer state included, when its listener failed: counting the
+        // failure against the row, or skipping on as a transient, would spend budget on a timer that
+        // drove successfully and bury the listener's failure in the batch
+        $queue = $this->createMock(DueTimerQueue::class);
+        $queue->method('claimDue')->willReturn([$this->row(TimerKind::Timeout)]);
+        $queue->expects($this->never())->method('recordFailure');
+        $queue->expects($this->never())->method('park');
+
+        $cause = new RuntimeException('the listener blew up');
+        $engine = $this->createStub(SagaTimerTarget::class);
+        $engine->method('timeout')->willThrowException(new SagaAnnouncementFailed($cause));
+
+        $clock = $this->createStub(Clock::class);
+        $clock->method('now')->willReturn(PointInTime::from('2026-01-01T10:00:00.000000+00:00'));
+
+        try {
+            new TimerRunner($queue, $engine, $clock)->tick();
+            $this->fail('the listener failure must reach the caller');
+        } catch (SagaAnnouncementFailed $failure) {
+            $this->assertSame($cause, $failure->getPrevious());
+            $this->assertSame('Saga announcement dispatch failed: the listener blew up', $failure->getMessage());
+        }
     }
 
     // rig

@@ -10,6 +10,7 @@ use Storm\Saga\Exception\SagaStorageFailure;
 use Storm\Saga\Exception\WorkflowNotFound;
 use Storm\Saga\Exception\WorkflowStateVersionMismatch;
 use Storm\Saga\Exception\WorkflowVersionNotFound;
+use Storm\Saga\Outbox\FailedWorkflowCommands;
 use Storm\Saga\Store\TimerKind;
 use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
@@ -31,6 +32,7 @@ final readonly class StepLoader
         private WorkflowInstances $instances,
         private WorkflowPauses $pauses,
         private WorkflowTimers $timers,
+        private FailedWorkflowCommands $commands,
     ) {}
 
     /**
@@ -39,6 +41,27 @@ final readonly class StepLoader
     public function find(WorkflowId $id): ?WorkflowInstanceRow
     {
         return $this->instances->find($id);
+    }
+
+    /**
+     * The effect-failure signal paired against the loaded run: its provenance is read here, under the
+     * fence and at the row's current generation, replacing whatever the signal carried. A redrive
+     * serialized before this read has already returned the row to flight, so the command reads as
+     * unpaired and the policy escalates instead of compensating it. Any other signal passes through.
+     *
+     * @throws SagaStorageFailure when the saga storage fails
+     */
+    public function withProvenance(Signal $signal, ?WorkflowInstanceRow $row): Signal
+    {
+        if ($signal->kind !== SignalKind::EffectFailure) {
+            return $signal;
+        }
+
+        $provenance = $row === null || $signal->failedMessageId === null
+            ? null
+            : $this->commands->provenance($row->correlationId, $signal->failedMessageId, $row->generation);
+
+        return Signal::effectFailure($signal->causationId, $signal->failedMessageId, $provenance);
     }
 
     /**

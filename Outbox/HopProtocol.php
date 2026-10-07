@@ -6,6 +6,7 @@ namespace Storm\Saga\Outbox;
 
 use Storm\Contracts\Message\MessageContext;
 use Storm\Contracts\Message\MetaIdentityGenerator;
+use Storm\Contracts\Message\TraceContextPropagation;
 use Storm\Message\Exception\InvalidMessageException;
 use Storm\Message\Header;
 use Storm\Message\Message;
@@ -35,6 +36,8 @@ use Storm\Saga\Store\WorkflowId;
  *  - The ambient declared bag: already filtered to the declared keys when the context was bound, so
  *    the whole bag rides along; the framework never reads its values.
  *
+ *  - Optional trace capture from the active span at sealing, independent of the ambient bag.
+ *
  *  - No causation: re-derived at each hop from the handled message's id, never transported.
  *
  * Deliberately NOT the message-module enricher chain: that chain is an OPEN extension point that any
@@ -57,6 +60,7 @@ final readonly class HopProtocol
     public function __construct(
         private MessageContext $context,
         private MetaIdentityGenerator $identity = new UuidV7MetaIdentityGenerator,
+        private ?TraceContextPropagation $tracing = null,
     ) {}
 
     /**
@@ -82,8 +86,11 @@ final readonly class HopProtocol
 
         // The declared bag survives the hop like the root principal does: the ambient values were
         // already filtered to the declared keys at bind time, so the copy is the whole bag.
-        foreach ($this->context->bag() as $key => $value) {
-            $headers[$key] = $value;
+        $headers = array_replace($headers, $this->context->bag());
+
+        if ($this->tracing !== null) {
+            $headers = array_diff_key($headers, array_flip(['traceparent', 'tracestate', 'baggage']));
+            $headers = array_replace($headers, $this->tracing->capture());
         }
 
         return new Message($command, $headers);

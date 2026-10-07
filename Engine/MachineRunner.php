@@ -17,6 +17,7 @@ use Storm\Saga\Engine\Verdict\Transition;
 use Storm\Saga\Exception\MissingAsyncTimeout;
 use Storm\Saga\Exception\MissingExtractField;
 use Storm\Saga\Exception\UnknownState;
+use Storm\Saga\Exception\UnsafeActivityCommands;
 use Storm\Saga\Exception\WorkflowStepLimitExceeded;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Workflow\ActivityState;
@@ -57,6 +58,7 @@ final readonly class MachineRunner
      * @throws WorkflowStepLimitExceeded when the synchronous transition chain exceeds the state count,
      *                                   a transition cycle, so it fails fast rather than looping forever
      * @throws UnknownState when a transition targets a state the definition doesn't declare
+     * @throws UnsafeActivityCommands when an activity emits commands without the required wait and confirmation contract
      * @throws MissingAsyncTimeout when an async activity state declares no timeout
      * @throws MissingExtractField when a map-declared extract field is absent from a matched event
      * @throws ClockExceptionContract when a breaker cooldown instant cannot be derived

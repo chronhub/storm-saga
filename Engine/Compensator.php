@@ -14,8 +14,10 @@ use Storm\Saga\Event\CompensationFailed;
 use Storm\Saga\Event\SagaCompensated;
 use Storm\Saga\Event\SagaCompensationSkipped;
 use Storm\Saga\Event\SagaHalted;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
+use Storm\Saga\Store\WorkflowStepWrites;
 use Storm\Saga\Workflow\Activity;
 use Storm\Saga\Workflow\ActivityOutcome;
 use Storm\Saga\Workflow\ActivityState;
@@ -147,23 +149,25 @@ final readonly class Compensator
      *
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      */
-    public function maybeCompensate(WorkflowDefinition $def, Rested $run, ?string $causationId): Rested
+    public function maybeCompensate(WorkflowDefinition $def, Rested $run, ?string $causationId, RecallVerdict $recalled): Rested
     {
         if ($run->row->status !== WorkflowStatus::Halted || $run->row->compensations === []) {
             return $run;
         }
 
-        return $this->compensate($def, $run->row, $run, $causationId, locationAgnostic: false);
+        return $this->compensate($def, $run->row, $run, $causationId, locationAgnostic: false, recalled: $recalled);
     }
 
     /**
      * Run the completed steps' compensations in reverse, each in the step's transaction. Three twists
      * over the naive "undo everything":
      *
-     *  - Conditional: a step is only undone if it is eligible, per `eligibleToCompensate()`. At a
-     *    positional halt, progression implies confirmation so untracked steps undo too; at a
-     *    `$locationAgnostic` global deadline, only steps whose effect was confirmed undo, and the
-     *    rest are `CompensationStatus::Skipped`, flagged via `SagaCompensationSkipped`.
+     *  - Conditional: a step `$recalled` proves never dispatched is skipped first, whatever else
+     *    holds. Any other step is
+     *    only undone if it is eligible, per `eligibleToCompensate()`: at a positional halt, untracked
+     *    steps undo too; at a `$locationAgnostic` global deadline, only steps whose effect was
+     *    confirmed undo. What is not undone is `CompensationStatus::Skipped`, flagged via
+     *    `SagaCompensationSkipped`.
      *
      *  - Mode: a failed undo is flagged via `CompensationFailed`, and the rollback either continues
      *    under `BestEffort`, or stops at the first failure and leaves the rest `Pending` under `Strict`.
@@ -178,9 +182,9 @@ final readonly class Compensator
      *
      * @throws ClockExceptionContract when a compensation timestamp cannot be derived
      *
-     * @see StepExecutor::applyEffects()
+     * @see WorkflowStepWrites::applyEffects()
      */
-    public function compensate(WorkflowDefinition $def, WorkflowInstanceRow $halted, Rested $carried, ?string $causationId, bool $locationAgnostic): Rested
+    public function compensate(WorkflowDefinition $def, WorkflowInstanceRow $halted, Rested $carried, ?string $causationId, bool $locationAgnostic, RecallVerdict $recalled): Rested
     {
         $type = $halted->workflowType;
         $corr = $halted->correlationId;
@@ -206,6 +210,14 @@ final readonly class Compensator
             $undo = $state instanceof ActivityState ? $this->undoFor($state, $record) : null;
             if (! $state instanceof ActivityState || $undo === null) {
                 continue; // defensive: only logged states with a compensation
+            }
+
+            if ($recalled->recalls($record)) {
+                // proven never dispatched: no effect to undo, whatever a strict stop left behind it
+                $resolved[$record->key()] = $record->settle(CompensationStatus::Skipped, 'recalled: never dispatched', $now);
+                $skipped[] = $record->key();
+
+                continue;
             }
 
             if ($stopped) {
@@ -235,7 +247,7 @@ final readonly class Compensator
                     $vars = $outcome->vars;
                     // the undo is itself durable: its issued commands ride the outbox, like the forward path;
                     // provenance is the compensated step, the state whose rollback issued them
-                    $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($record->step, $command, $record->arm), $outcome->commands)];
+                    $commands = [...$commands, ...array_map(static fn (object $command): IssuedCommand => new IssuedCommand($record->step, $command, CommandPurpose::Compensation, $record->arm), $outcome->commands)];
                     $resolved[$record->key()] = $record->settle(CompensationStatus::Compensated, null, $now);
                 } else {
                     $error = $outcome->error ?? 'compensation failed';
@@ -271,16 +283,17 @@ final readonly class Compensator
             $events[] = new SagaHalted($type, $corr, $halted->generation, $halted->stateKey);
         }
 
-        return new Rested($halted->settled($status, $vars, $log), $events, [], $commands);
+        // the carried timer ops ride on: a halt in the step that crossed a timed wait owes that wait's cancel
+        return new Rested($halted->settled($status, $vars, $log), $events, $carried->timerOps, $commands);
     }
 
     /**
-     * Whether a logged step may be undone now. At a positional halt, the saga's progression past the
-     * step already implies its effect happened, so an untracked step with no `confirmedBy` is
-     * eligible too, and only a tracked-but-unconfirmed step is skipped. At a location-agnostic global
-     * deadline, intent does not equal confirmed effect, so only an explicitly confirmed step is
-     * eligible; untracked ones are unverifiable here, hence skipped, the option-A safety scoped to
-     * the unconfirmable.
+     * Whether a logged step the recall did not settle may be undone now. At a positional halt, an
+     * untracked step with no `confirmedBy` is eligible too, the saga having moved past it with no
+     * proof that its commands never left, and only a tracked-but-unconfirmed step is skipped. At a
+     * location-agnostic global deadline, intent does not equal confirmed effect, so only an explicitly
+     * confirmed step is eligible; untracked ones are unverifiable here, hence skipped, the option-A
+     * safety scoped to the unconfirmable.
      *
      * A degraded step, success salvaged by a fallback, is never eligible: its real effect is
      * uncertain, since a static default did nothing and an alternative activity's effect will not

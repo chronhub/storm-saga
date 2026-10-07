@@ -6,6 +6,7 @@ namespace Storm\Saga\Outbox;
 
 use Storm\Saga\Engine\EffectEvidence;
 use Storm\Saga\Engine\EffectProvenance;
+use Storm\Saga\Exception\FenceIsolationRefused;
 use Storm\Saga\Exception\SagaStorageFailure;
 
 /**
@@ -73,14 +74,19 @@ interface FailedWorkflowCommands
      * - The row's generation is the saga's CURRENT one, so a command issued by an earlier run of a
      *   reusing correlation can never be re-sent into the run that replaced it.
      *
+     * The predicate alone cannot see a step that has decided but not yet committed, such as a settle
+     * about to halt the saga. Where steps run under a fence, the flip takes that same fence first and
+     * never waits for it: a step holding it turns the redrive into `Raced`, with nothing changed.
+     *
      * Two seams this rides rather than fights. The relay claims `pending` rows under
      * `FOR UPDATE SKIP LOCKED`, and this row is `failed` until the statement commits, so it enters
-     * that claim already whole. And the reconcile sweep cannot settle around it, since `provenance()`
-     * refuses to pair a row that left the dead-letter state; without that refusal this whole verb
+     * that claim already whole. And the reconcile sweep cannot settle around it, since it reads `provenance()` under the same fence
+     * and refuses to pair a row that left the dead-letter state; without that refusal this whole verb
      * would compensate and re-send the same command at once.
      *
      * @param  bool  $force  own the risk of a possibly-committed effect explicitly
      *
+     * @throws FenceIsolationRefused when a transactional adapter requires `READ COMMITTED` and the caller uses another isolation level
      * @throws SagaStorageFailure when the storage fails; the adapter wraps the driver's failure, cause chained
      */
     public function redrive(string $correlationId, string $messageId, bool $force = false): RedriveOutcome;

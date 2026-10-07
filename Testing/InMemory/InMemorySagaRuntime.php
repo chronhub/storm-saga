@@ -29,6 +29,7 @@ use Storm\Saga\Engine\FamilyGate;
 use Storm\Saga\Engine\JoinSettler;
 use Storm\Saga\Engine\MachineRunner;
 use Storm\Saga\Engine\RaceSettler;
+use Storm\Saga\Engine\RecallJudge;
 use Storm\Saga\Engine\State\ActivityRunner;
 use Storm\Saga\Engine\State\FinalRunner;
 use Storm\Saga\Engine\State\ScheduleRunner;
@@ -164,18 +165,20 @@ final readonly class InMemorySagaRuntime
             $compensator,
         );
         $outbox = new WorkflowOutbox(new HopProtocol(ContextValues::empty(), new DeterministicIdentity($state)), $commands);
+        $recalls = new RecallJudge($outbox);
 
         $executor = new StepExecutor(
             new InMemoryStepUnitOfWork($state),
-            new StepLoader($instances, $instances, $timers),
+            new StepLoader($instances, $instances, $timers, $commands),
             new StepPolicy,
             new StepPerformer(
                 $machine,
                 $compensator,
+                $recalls,
                 new WaitEscalator,
-                new DeadlineEnforcer($machine, $compensator),
-                new FailedEffectSettler($compensator),
-                new Canceller($compensator),
+                new DeadlineEnforcer($machine, $compensator, $recalls),
+                new FailedEffectSettler($compensator, $recalls),
+                new Canceller($compensator, $recalls),
                 new JoinSettler($outbox, $clock, $extraction),
                 new RaceSettler($outbox, $clock),
                 new FamilyGate($instances, $extraction),
@@ -185,7 +188,7 @@ final readonly class InMemorySagaRuntime
             $events,
         );
 
-        $engine = new Engine($registry, $executor, $instances, $commands);
+        $engine = new Engine($registry, $executor, $instances);
 
         // the real child handlers over the same engine, stores and dispatcher the wired deployment
         // gives them, so the sequential model drives the true guards, lineage and birth
@@ -251,19 +254,11 @@ final readonly class InMemorySagaRuntime
      */
     public function commands(?OutboxStatus $status = null, ?string $payloadClass = null): array
     {
-        $captured = [];
-        foreach ($this->state->commands as $row) {
-            if ($status instanceof OutboxStatus && $row['status'] !== $status->value) {
-                continue;
-            }
-            $command = $this->capture($row);
-            if ($payloadClass !== null && ! $command->payload() instanceof $payloadClass) {
-                continue;
-            }
-            $captured[] = $command;
-        }
+        $rows = array_filter($this->state->commands, static fn (array $row): bool => ! $status instanceof OutboxStatus || $row['status'] === $status->value);
 
-        return $captured;
+        return array_map($this->capture(...), $rows)
+            |> (static fn (array $captured): array => array_filter($captured, static fn (CapturedCommand $command): bool => $payloadClass === null || $command->payload() instanceof $payloadClass))
+            |> array_values(...);
     }
 
     /**
@@ -288,7 +283,7 @@ final readonly class InMemorySagaRuntime
      */
     public function takeCommand(string $payloadClass): CapturedCommand
     {
-        return $this->pendingCommands($payloadClass)[0]
+        return array_first($this->pendingCommands($payloadClass))
             ?? throw new RuntimeException(sprintf('No pending command wraps "%s".', $payloadClass));
     }
 
@@ -396,7 +391,7 @@ final readonly class InMemorySagaRuntime
 
     private function assertPublished(CapturedCommand $command, string $verb): void
     {
-        if (array_any($this->commands(OutboxStatus::Published), fn ($published) => $published->messageId === $command->messageId)) {
+        if (array_any($this->commands(OutboxStatus::Published), static fn (CapturedCommand $published): bool => $published->messageId === $command->messageId)) {
             return;
         }
 
@@ -421,11 +416,10 @@ final readonly class InMemorySagaRuntime
     /** Drop the published command rows, so a scenario's next phase inspects only its own issues. */
     public function resetPublishedCommands(): void
     {
-        foreach ($this->state->commands as $id => $row) {
-            if ($row['status'] === OutboxStatus::Published->value) {
-                unset($this->state->commands[$id]);
-            }
-        }
+        $this->state->commands = array_filter(
+            $this->state->commands,
+            static fn (array $row): bool => $row['status'] !== OutboxStatus::Published->value,
+        );
     }
 
     /**

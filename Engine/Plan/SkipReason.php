@@ -24,6 +24,12 @@ enum SkipReason
     /** A second `start` for an existing instance; start is idempotent. */
     case AlreadyStarted;
 
+    /**
+     * A completion or contradictory failure for a join arm already recorded as arrived.
+     * The first verdict stands; delivery is absorbed without retrying or changing the instance.
+     */
+    case JoinArmAlreadyArrived;
+
     /** The timer's state was left before it fired, the timer raced a transition. */
     case StaleState;
 

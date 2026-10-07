@@ -47,16 +47,16 @@ final readonly class EffectRules
             }
         }
 
-        foreach (array_keys($raceArms) as $stateKey) {
-            if (count($successEdges[$stateKey] ?? []) > 1) {
-                throw InvalidWorkflowDefinition::raceWithMoreThanOneSuccessEdge((string) $stateKey, $workflow);
-            }
+        $hasMoreThanOneSuccessEdge = static fn (array $arms, int|string $stateKey): bool => count($successEdges[$stateKey] ?? []) > 1;
+
+        $raceKey = array_find_key($raceArms, $hasMoreThanOneSuccessEdge);
+        if ($raceKey !== null) {
+            throw InvalidWorkflowDefinition::raceWithMoreThanOneSuccessEdge((string) $raceKey, $workflow);
         }
 
-        foreach (array_keys($joinArms) as $stateKey) {
-            if (count($successEdges[$stateKey] ?? []) > 1) {
-                throw InvalidWorkflowDefinition::joinWithMoreThanOneSuccessEdge((string) $stateKey, $workflow);
-            }
+        $joinKey = array_find_key($joinArms, $hasMoreThanOneSuccessEdge);
+        if ($joinKey !== null) {
+            throw InvalidWorkflowDefinition::joinWithMoreThanOneSuccessEdge((string) $joinKey, $workflow);
         }
     }
 
@@ -94,10 +94,10 @@ final readonly class EffectRules
                 if (trim($arm->arm) === '') {
                     throw InvalidWorkflowDefinition::raceArmBlankName($stateKey, $workflow);
                 }
-                foreach (['command' => $arm->command, 'wonBy' => $arm->wonBy, 'compensate' => $arm->compensate] as $field => $class) {
-                    if (! class_exists($class)) {
-                        throw InvalidWorkflowDefinition::raceArmUnknownClass($arm->arm, $field, $class, $stateKey, $workflow);
-                    }
+                $classes = ['command' => $arm->command, 'wonBy' => $arm->wonBy, 'compensate' => $arm->compensate];
+                $unknown = array_find_key($classes, static fn (string $class): bool => ! class_exists($class));
+                if ($unknown !== null) {
+                    throw InvalidWorkflowDefinition::raceArmUnknownClass($arm->arm, $unknown, $classes[$unknown], $stateKey, $workflow);
                 }
                 if (isset($commands[$arm->command])) {
                     throw InvalidWorkflowDefinition::raceArmsShareACommand($arm->command, $stateKey, $workflow);
@@ -108,11 +108,13 @@ final readonly class EffectRules
                 // each pair once, the join sibling's shape: visited in both orders, the second is_a
                 // is redundant and its removal survives every test; visited once, both directions
                 // are load-bearing, since subtyping runs one way only
-                foreach ($arms as $j => $other) {
-                    if ($i < $j
-                        && (is_a($arm->wonBy, $other->wonBy, true) || is_a($other->wonBy, $arm->wonBy, true))) {
-                        throw InvalidWorkflowDefinition::raceArmOutcomesOverlap($arm->arm, $other->arm, $stateKey, $workflow);
-                    }
+                $overlapping = array_find(
+                    $arms,
+                    static fn (RaceArm $other, int|string $j): bool => $i < $j
+                        && (is_a($arm->wonBy, $other->wonBy, true) || is_a($other->wonBy, $arm->wonBy, true)),
+                );
+                if ($overlapping !== null) {
+                    throw InvalidWorkflowDefinition::raceArmOutcomesOverlap($arm->arm, $overlapping->arm, $stateKey, $workflow);
                 }
             }
         }
@@ -159,10 +161,9 @@ final readonly class EffectRules
                 if ($arm->failedBy !== null) {
                     $classes['failedBy'] = $arm->failedBy;
                 }
-                foreach ($classes as $field => $class) {
-                    if (! class_exists($class)) {
-                        throw InvalidWorkflowDefinition::joinArmUnknownClass($arm->arm, $field, $class, $stateKey, $workflow);
-                    }
+                $unknown = array_find_key($classes, static fn (string $class): bool => ! class_exists($class));
+                if ($unknown !== null) {
+                    throw InvalidWorkflowDefinition::joinArmUnknownClass($arm->arm, $unknown, $classes[$unknown], $stateKey, $workflow);
                 }
                 if (isset($commands[$arm->command])) {
                     throw InvalidWorkflowDefinition::joinArmsShareACommand($arm->command, $stateKey, $workflow);
@@ -177,11 +178,13 @@ final readonly class EffectRules
             }
 
             foreach ($events as $i => $entry) {
-                foreach ($events as $j => $other) {
-                    if ($i < $j
-                        && (is_a($entry['class'], $other['class'], true) || is_a($other['class'], $entry['class'], true))) {
-                        throw InvalidWorkflowDefinition::joinArmEventsOverlap($entry['arm'], $entry['field'], $other['arm'], $other['field'], $stateKey, $workflow);
-                    }
+                $other = array_find(
+                    $events,
+                    static fn (array $other, int $j): bool => $i < $j
+                        && (is_a($entry['class'], $other['class'], true) || is_a($other['class'], $entry['class'], true)),
+                );
+                if ($other !== null) {
+                    throw InvalidWorkflowDefinition::joinArmEventsOverlap($entry['arm'], $entry['field'], $other['arm'], $other['field'], $stateKey, $workflow);
                 }
             }
         }
@@ -214,15 +217,14 @@ final readonly class EffectRules
             }
 
             $wonBy = array_map(static fn ($arm): string => $arm->wonBy, $state->race->arms);
-            foreach ($wonBy as $armName => $outcome) {
-                if (! in_array($outcome, $wait->eventClasses, true)) {
-                    throw InvalidWorkflowDefinition::raceArmOutcomeNotAwaited((string) $armName, $outcome, $wait->key, $workflow);
-                }
+            $notAwaited = array_find_key($wonBy, static fn (string $outcome): bool => ! in_array($outcome, $wait->eventClasses, true));
+            if ($notAwaited !== null) {
+                throw InvalidWorkflowDefinition::raceArmOutcomeNotAwaited((string) $notAwaited, $wonBy[$notAwaited], $wait->key, $workflow);
             }
-            foreach ($wait->eventClasses as $accepted) {
-                if (! in_array($accepted, $wonBy, true)) {
-                    throw InvalidWorkflowDefinition::raceWaitAcceptsForeignEvent($accepted, $wait->key, $state->key, $workflow);
-                }
+
+            $foreign = array_find($wait->eventClasses, static fn (string $accepted): bool => ! in_array($accepted, $wonBy, true));
+            if ($foreign !== null) {
+                throw InvalidWorkflowDefinition::raceWaitAcceptsForeignEvent($foreign, $wait->key, $state->key, $workflow);
             }
         }
     }
@@ -251,12 +253,10 @@ final readonly class EffectRules
                 throw InvalidWorkflowDefinition::joinWaitUsesAliases($state->key, $wait->key, $workflow);
             }
 
-            $routed = [];
-            foreach ($wait->transitions as $transition) {
-                if ($transition->onEvent !== null) {
-                    $routed[] = $transition->onEvent;
-                }
-            }
+            $routed = array_filter(
+                array_map(static fn ($transition): ?string => $transition->onEvent, $wait->transitions),
+                static fn (?string $event): bool => $event !== null,
+            );
 
             $armEvents = [];
             foreach ($state->join->arms as $armName => $arm) {
@@ -282,10 +282,9 @@ final readonly class EffectRules
                     }
                 }
             }
-            foreach ($wait->eventClasses as $accepted) {
-                if (! in_array($accepted, $armEvents, true)) {
-                    throw InvalidWorkflowDefinition::joinWaitAcceptsForeignEvent($accepted, $wait->key, $state->key, $workflow);
-                }
+            $foreign = array_find($wait->eventClasses, static fn (string $accepted): bool => ! in_array($accepted, $armEvents, true));
+            if ($foreign !== null) {
+                throw InvalidWorkflowDefinition::joinWaitAcceptsForeignEvent($foreign, $wait->key, $state->key, $workflow);
             }
         }
     }
@@ -306,16 +305,14 @@ final readonly class EffectRules
      */
     public function engineOwnsEffectGatingDeadlines(string $workflow, array $states): void
     {
-        foreach ($states as $wait) {
-            if (! $wait instanceof WaitState || ! EffectGating::gates($states, $wait->key)) {
-                continue;
-            }
-
-            foreach ($wait->transitions as $transition) {
-                if ($transition->trigger === OnTrigger::Timeout) {
-                    throw InvalidWorkflowDefinition::timeoutOwnedByEngineOnEffectGatingWait($wait->key, $workflow);
-                }
-            }
+        $wait = array_find(
+            $states,
+            static fn (State $wait): bool => $wait instanceof WaitState
+                && EffectGating::gates($states, $wait->key)
+                && array_any($wait->transitions, static fn ($transition): bool => $transition->trigger === OnTrigger::Timeout),
+        );
+        if ($wait !== null) {
+            throw InvalidWorkflowDefinition::timeoutOwnedByEngineOnEffectGatingWait($wait->key, $workflow);
         }
     }
 
@@ -338,10 +335,12 @@ final readonly class EffectRules
                 continue;
             }
 
-            foreach ($state->transitions as $transition) {
-                if ($transition->trigger === OnTrigger::Success && ($states[$transition->to] ?? null) instanceof WaitState) {
-                    throw InvalidWorkflowDefinition::compensationUnverifiableAtGatingWait($state->key, $transition->to, $workflow);
-                }
+            $gated = array_find(
+                $state->transitions,
+                static fn ($transition): bool => $transition->trigger === OnTrigger::Success && ($states[$transition->to] ?? null) instanceof WaitState,
+            );
+            if ($gated !== null) {
+                throw InvalidWorkflowDefinition::compensationUnverifiableAtGatingWait($state->key, $gated->to, $workflow);
             }
         }
     }

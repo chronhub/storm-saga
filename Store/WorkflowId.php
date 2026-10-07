@@ -6,6 +6,7 @@ namespace Storm\Saga\Store;
 
 use Storm\Saga\Child\ChildCorrelation;
 use Storm\Saga\Exception\InvalidWorkflowId;
+use Storm\Support\Text\Str;
 
 /**
  * Identifies one saga instance: its `workflowType`, the `#[Workflow]` name, and the business
@@ -66,7 +67,7 @@ final readonly class WorkflowId
      */
     private static function guard(string $field, string $value): void
     {
-        if (trim($value) === '') {
+        if (Str::isBlank($value)) {
             throw InvalidWorkflowId::empty($field);
         }
 

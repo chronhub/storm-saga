@@ -10,6 +10,7 @@ use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use Storm\Clock\PointInTime;
 use Storm\Saga\Locking\SagaStepUnitOfWork;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\WorkflowOutboxWriter;
 use Storm\Saga\Store\TimerKind;
 use Storm\Saga\Store\WorkflowId;
@@ -52,7 +53,7 @@ final class InMemorySagaStoreContractTest extends TestCase
         $commands = new InMemoryWorkflowCommands($this->state, new DefaultMessageSerializer, $this->clock);
         for ($i = 0; $i < 1001; $i++) {
             $messageId = sprintf('failed-%04d', $i);
-            $commands->write($id, $this->sealed($messageId), 'await', 0, 1);
+            $commands->write($id, $this->sealed($messageId), 'await', 0, 1, CommandPurpose::Forward);
             $commands->markPublished($messageId);
             $commands->markFailed('many-failures', $messageId, 'refused');
         }
@@ -94,11 +95,11 @@ final class InMemorySagaStoreContractTest extends TestCase
     public function a_pending_command_does_not_strand_its_instance(): void
     {
         $this->contractInstances()->create($this->row('law', 'pending'));
-        $this->contractCommands()->write(new WorkflowId('law', 'pending'), $this->sealed('pending-message'), 'await', 0, 1);
+        $this->contractCommands()->write(new WorkflowId('law', 'pending'), $this->sealed('pending-message'), 'await', 0, 1, CommandPurpose::Forward);
         $this->assertSame([], $this->contractInstances()->strandedByFailedEffect());
         $commands = new InMemoryWorkflowCommands($this->state, new DefaultMessageSerializer, $this->clock);
         $this->contractInstances()->create($this->row('law', 'failed'));
-        $commands->write(new WorkflowId('law', 'failed'), $this->sealed('failed-message'), 'await', 0, 1);
+        $commands->write(new WorkflowId('law', 'failed'), $this->sealed('failed-message'), 'await', 0, 1, CommandPurpose::Forward);
         $this->assertTrue($commands->markPublished('failed-message'));
         $this->assertTrue($commands->markFailed('failed', 'failed-message', 'refused'));
         $this->assertSame([['failed', 'failed-message']], $this->contractInstances()->strandedByFailedEffect());
@@ -273,7 +274,7 @@ final class InMemorySagaStoreContractTest extends TestCase
         $commands = $this->contractCommands();
         assert($commands instanceof InMemoryWorkflowCommands);
         $this->contractInstances()->create($this->row('law', 'c-once'));
-        $commands->write(new WorkflowId('law', 'c-once'), $this->sealed('m-once'), 'issuing', 3, 1);
+        $commands->write(new WorkflowId('law', 'c-once'), $this->sealed('m-once'), 'issuing', 3, 1, CommandPurpose::Forward);
 
         $this->assertFalse($commands->markPublished('m-ghost'));
         $this->assertTrue($commands->markPublished('m-once'));
@@ -338,5 +339,61 @@ final class InMemorySagaStoreContractTest extends TestCase
     {
         assert($commands instanceof InMemoryWorkflowCommands);
         $this->assertTrue($commands->markPublished($messageId));
+    }
+
+    #[Test]
+    public function the_attempt_stand_in_refuses_an_unknown_or_settled_row(): void
+    {
+        $commands = $this->contractCommands();
+        assert($commands instanceof InMemoryWorkflowCommands);
+        $commands->write(new WorkflowId('law', 'c-stand-in'), $this->sealed('m-stand-in'), 'issuing', 3, 1, CommandPurpose::Forward);
+
+        $this->assertFalse($commands->markAttempted('m-unknown'));
+        $this->assertTrue($commands->markPublished('m-stand-in'));
+        $this->assertFalse($commands->markAttempted('m-stand-in')); // published, no longer the relay's to try
+    }
+
+    protected function spendAnAttempt(WorkflowOutboxWriter $commands, string $correlationId, string $messageId): void
+    {
+        assert($commands instanceof InMemoryWorkflowCommands);
+        $this->assertTrue($commands->markAttempted($messageId));
+    }
+
+    #[Test]
+    public function the_claim_stand_in_refuses_an_unknown_or_settled_row(): void
+    {
+        $commands = $this->contractCommands();
+        assert($commands instanceof InMemoryWorkflowCommands);
+        $commands->write(new WorkflowId('law', 'c-claim-in'), $this->sealed('m-claim-in'), 'issuing', 3, 1, CommandPurpose::Forward);
+
+        $this->assertFalse($commands->markClaimed('m-unknown', $this->clock->now()->addSeconds(300)));
+        $this->assertTrue($commands->markPublished('m-claim-in'));
+        $this->assertFalse($commands->markClaimed('m-claim-in', $this->clock->now()->addSeconds(300))); // published, no longer the relay's to take
+    }
+
+    #[Test]
+    public function a_live_claim_holds_the_abort_off_until_its_exact_deadline(): void
+    {
+        // the boundary only this controlled clock can pin exactly: one second before its deadline the
+        // lease still runs, and at the deadline it has lapsed, as the relay's claim reads a lease that
+        // ends now as a drain that was lost
+        $commands = $this->contractCommands();
+        assert($commands instanceof InMemoryWorkflowCommands);
+        $id = new WorkflowId('law', 'c-deadline');
+        $this->contractInstances()->create($this->row('law', 'c-deadline'));
+        $commands->write($id, $this->sealed('m-deadline'), 'issuing', 3, 1, CommandPurpose::Forward);
+        $this->assertTrue($commands->markClaimed('m-deadline', $this->clock->now()->addSeconds(300)));
+
+        $this->clock->advanceSeconds(299);
+        $this->assertSame(0, $commands->cancelPending($id, 1, []));
+
+        $this->clock->advanceSeconds(1);
+        $this->assertSame(1, $commands->cancelPending($id, 1, []));
+    }
+
+    protected function holdUnderLiveClaim(WorkflowOutboxWriter $commands, string $correlationId, string $messageId): void
+    {
+        assert($commands instanceof InMemoryWorkflowCommands);
+        $this->assertTrue($commands->markClaimed($messageId, $this->clock->now()->addSeconds(300)));
     }
 }

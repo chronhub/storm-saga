@@ -10,12 +10,14 @@ use Storm\Message\Header;
 use Storm\Message\Message;
 use Storm\Saga\Engine\EffectEvidence;
 use Storm\Saga\Engine\EffectProvenance;
+use Storm\Saga\Outbox\CommandPurpose;
 use Storm\Saga\Outbox\OutboxStatus;
 use Storm\Saga\Outbox\RedriveOutcome;
 use Storm\Saga\Outbox\WorkflowOutboxWriter;
 use Storm\Saga\Store\WorkflowId;
 use Storm\Saga\Store\WorkflowInstanceRow;
 use Storm\Saga\Store\WorkflowStatus;
+use Storm\Saga\Workflow\CompensationRecord;
 use Storm\Serializer\MessageSerializer;
 
 /**
@@ -42,7 +44,7 @@ final readonly class InMemoryWorkflowCommands implements WorkflowOutboxWriter
         private string $bus = 'storm.command.bus',
     ) {}
 
-    public function write(WorkflowId $id, Message $message, string $issuedFromState, int $issuedAtVersion, int $generation, ?string $effectGroup = null): void
+    public function write(WorkflowId $id, Message $message, string $issuedFromState, int $issuedAtVersion, int $generation, CommandPurpose $purpose, ?string $effectGroup = null): void
     {
         ['header' => $header, 'content' => $content] = $this->serializer->serialize($message);
 
@@ -66,6 +68,8 @@ final readonly class InMemoryWorkflowCommands implements WorkflowOutboxWriter
             'issuedAtVersion' => $issuedAtVersion,
             'generation' => $generation,
             'effectGroup' => $effectGroup,
+            'purpose' => $purpose->value,
+            'claimedUntil' => null,
             // @infection-ignore-all
             'evidence' => EffectEvidence::Unknown->value,
             'lastError' => null,
@@ -82,7 +86,7 @@ final readonly class InMemoryWorkflowCommands implements WorkflowOutboxWriter
             || $row['status'] !== OutboxStatus::Failed->value || $row['issuedFromState'] === '') {
             return null;
         }
-        $aliveSiblings = array_any($this->state->commands, fn ($sibling) => $sibling['id'] !== $row['id']
+        $aliveSiblings = array_any($this->state->commands, static fn (array $sibling): bool => $sibling['id'] !== $row['id']
             && $sibling['correlationId'] === $row['correlationId']
             && $sibling['generation'] === $row['generation']
             && $sibling['issuedAtVersion'] === $row['issuedAtVersion']
@@ -150,24 +154,65 @@ final readonly class InMemoryWorkflowCommands implements WorkflowOutboxWriter
         return RedriveOutcome::EffectUnproven;
     }
 
-    public function cancelPending(WorkflowId $id, ?string $effectGroup = null): int
+    public function cancelPending(WorkflowId $id, int $generation, array $spared): int
     {
-        $recalled = 0;
-        foreach ($this->state->commands as $commandId => $row) {
-            if ($row['workflowType'] !== $id->workflowType || $row['correlationId'] !== $id->correlationId
-                || $row['status'] !== OutboxStatus::Pending->value) {
-                continue;
-            }
-            if ($effectGroup !== null && $row['effectGroup'] !== $effectGroup) {
-                continue;
-            }
-            $row['status'] = OutboxStatus::Cancelled->value;
-            $row['processedAt'] = $this->clock->now()->toString();
-            $this->state->commands[$commandId] = $row;
-            $recalled++;
-        }
+        $now = $this->clock->now();
 
-        return $recalled;
+        return $this->recall(static fn ($row): bool => $row['workflowType'] === $id->workflowType
+            && $row['correlationId'] === $id->correlationId
+            && $row['generation'] === $generation
+            && $row['status'] === OutboxStatus::Pending->value
+            && $row['purpose'] === CommandPurpose::Forward->value
+            // a lease still running: the relay may be publishing the row right now
+            && ! (is_string($row['claimedUntil']) && PointInTime::from($row['claimedUntil'])->isAfter($now))
+            // an undone entry's do, still owed to the undo issued for it
+            && ! array_any($spared, static fn (CompensationRecord $entry): bool => $entry->step === $row['issuedFromState'] && $entry->arm === $row['effectGroup']));
+    }
+
+    public function recallUndispatched(WorkflowId $id, int $generation, string $issuedFromState, string $effectGroup): int
+    {
+        return $this->recall(static fn ($row): bool => $row['workflowType'] === $id->workflowType
+            && $row['correlationId'] === $id->correlationId
+            && $row['generation'] === $generation
+            && $row['issuedFromState'] === $issuedFromState
+            && $row['effectGroup'] === $effectGroup
+            && $row['status'] === OutboxStatus::Pending->value
+            && $row['purpose'] === CommandPurpose::Forward->value
+            && $row['claimedUntil'] === null);
+    }
+
+    public function forwardClaims(WorkflowId $id, int $generation, string $issuedFromState, ?string $effectGroup): array
+    {
+        // the rows are kept in id order, and nothing can claim one between this read and the settle
+        // of a single thread, so the order is the only half of the lock the model needs
+        $forwards = array_filter($this->state->commands, static fn (array $row): bool => $row['workflowType'] === $id->workflowType
+            && $row['correlationId'] === $id->correlationId
+            && $row['generation'] === $generation
+            && $row['issuedFromState'] === $issuedFromState
+            && $row['effectGroup'] === $effectGroup
+            && $row['purpose'] === CommandPurpose::Forward->value);
+
+        return array_map(static fn (array $row): bool => $row['claimedUntil'] !== null, $forwards) |> array_values(...);
+    }
+
+    /**
+     * The test's stand-in for a relay attempt that failed transiently: the pending row found by its
+     * sealed message id spends an attempt and carries the claim marker, as the relay's back-off
+     * leaves it. Returns false when no pending row carries the id.
+     */
+    public function markAttempted(string $messageId): bool
+    {
+        return $this->claim($messageId, $this->clock->now());
+    }
+
+    /**
+     * The test's stand-in for the relay's live claim: the pending row found by its sealed message id
+     * spends a claim and holds a lease until `$until`, as a drain leaves the row while it publishes.
+     * Returns false when no pending row carries the id.
+     */
+    public function markClaimed(string $messageId, PointInTime $until): bool
+    {
+        return $this->claim($messageId, $until);
     }
 
     /**
@@ -177,29 +222,82 @@ final readonly class InMemoryWorkflowCommands implements WorkflowOutboxWriter
      */
     public function markPublished(string $messageId): bool
     {
-        foreach ($this->state->commands as $commandId => $row) {
-            if (($row['header'][Header::MessageId->value] ?? null) === $messageId && $row['status'] === OutboxStatus::Pending->value) {
-                $row['status'] = OutboxStatus::Published->value;
-                $row['processedAt'] = $this->clock->now()->toString();
-                $this->state->commands[$commandId] = $row;
-
-                return true;
-            }
+        $commandId = $this->pendingByMessageId($messageId);
+        if ($commandId === null) {
+            return false;
         }
 
-        return false;
+        $row = $this->state->commands[$commandId];
+        $row['status'] = OutboxStatus::Published->value;
+        $row['processedAt'] = $this->clock->now()->toString();
+        $row['claimedUntil'] = $row['processedAt'];
+        $this->state->commands[$commandId] = $row;
+
+        return true;
     }
 
     /**
-     * @return array{id: int, workflowType: string, correlationId: string, bus: string, header: array<string, mixed>, content: array<string, mixed>, status: string, attempts: int, issuedFromState: string, issuedAtVersion: int, generation: int, effectGroup: string|null, evidence: string, lastError: string|null, createdAt: string, processedAt: string|null}|null
+     * @return array{id: int, workflowType: string, correlationId: string, bus: string, header: array<string, mixed>, content: array<string, mixed>, status: string, attempts: int, issuedFromState: string, issuedAtVersion: int, generation: int, effectGroup: string|null, purpose: string, claimedUntil: string|null, evidence: string, lastError: string|null, createdAt: string, processedAt: string|null}|null
      */
     private function rowByMessageId(string $correlationId, string $messageId): ?array
     {
         return array_find(
             $this->state->commands,
-            fn ($row) => $row['correlationId'] === $correlationId && ($row['header'][Header::MessageId->value] ?? null) === $messageId
+            static fn (array $row): bool => $row['correlationId'] === $correlationId && ($row['header'][Header::MessageId->value] ?? null) === $messageId,
         );
+    }
 
+    /**
+     * The key of the pending row carrying `$messageId`, the lookup every relay stand-in shares.
+     */
+    private function pendingByMessageId(string $messageId): ?int
+    {
+        return array_find_key(
+            $this->state->commands,
+            static fn (array $row): bool => ($row['header'][Header::MessageId->value] ?? null) === $messageId && $row['status'] === OutboxStatus::Pending->value,
+        );
+    }
+
+    /**
+     * Spend one claim on the pending row carrying `$messageId` and set its claim marker to `$until`,
+     * the one write both relay stand-ins share.
+     */
+    private function claim(string $messageId, PointInTime $until): bool
+    {
+        $commandId = $this->pendingByMessageId($messageId);
+        if ($commandId === null) {
+            return false;
+        }
+
+        $row = $this->state->commands[$commandId];
+        // @infection-ignore-all; equivalent: the model has no relay, so the spent claim has no reader
+        $row['attempts']++;
+        $row['claimedUntil'] = $until->toString();
+        $this->state->commands[$commandId] = $row;
+
+        return true;
+    }
+
+    /**
+     * Cancel every row `$selects` picks, the one write both recalls share.
+     *
+     * @param  callable(array<string, mixed>): bool  $selects
+     * @return int the number of rows recalled
+     */
+    private function recall(callable $selects): int
+    {
+        $recalled = 0;
+        foreach ($this->state->commands as $commandId => $row) {
+            if (! $selects($row)) {
+                continue;
+            }
+            $row['status'] = OutboxStatus::Cancelled->value;
+            $row['processedAt'] = $this->clock->now()->toString();
+            $this->state->commands[$commandId] = $row;
+            $recalled++;
+        }
+
+        return $recalled;
     }
 
     private function instanceOf(string $workflowType, string $correlationId): ?WorkflowInstanceRow

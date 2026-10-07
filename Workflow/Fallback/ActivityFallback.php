@@ -10,7 +10,8 @@ use Storm\Saga\Workflow\Metadata;
 
 /**
  * Degrade to an alternative activity such as a secondary provider or a cheaper path. Runs the activity
- * like the primary, and it may itself succeed, fail, or issue commands. Declared as
+ * like the primary. Successful commands obey the primary state's wait and confirmation contract.
+ * Async results do not salvage the step and their commands are ignored. Declared as
  * `#[Fallback(state:, activity: SecondaryProvider::class)]`.
  */
 final readonly class ActivityFallback implements FallbackStrategy
